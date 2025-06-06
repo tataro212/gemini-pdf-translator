@@ -1,0 +1,43 @@
+# Gemini PDF Translator Configuration Template
+# Copy this file to 'config.ini' and fill in your actual values
+
+[Gemini]
+# Get your API key from: https://makersuite.google.com/app/apikey
+api_key = YOUR_GEMINI_API_KEY_HERE
+model_name = models/gemini-1.5-pro
+temperature = 0.1
+max_tokens = 8192
+
+[General]
+# Target language for translation
+target_language = Greek
+source_language = auto
+# Enable Nougat-only mode for advanced visual processing
+nougat_only_mode = False
+# Enable Google Drive upload for outputs
+enable_drive_upload = False
+
+[Optimization]
+# Smart grouping reduces API calls by combining related content
+enable_smart_grouping = True
+max_group_size_chars = 8000
+# Caching prevents re-translating the same content
+enable_caching = True
+cache_expiry_days = 30
+
+[Image_Processing]
+# Extract and process images from PDFs
+extract_images = True
+min_image_size = 100
+max_image_size = 2000
+image_quality_threshold = 0.7
+# Enable advanced visual content processing with Nougat
+enable_nougat_processing = True
+
+[Advanced]
+# Enable debug logging
+debug_mode = False
+# Maximum pages to process (0 = no limit)
+max_pages = 0
+# Enable visual inspection tools
+enable_visual_inspection = True

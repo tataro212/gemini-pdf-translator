@@ -1,0 +1,42 @@
+# Core dependencies
+google-generativeai>=0.3.0
+PyMuPDF>=1.23.0
+Pillow>=10.0.0
+python-docx>=1.1.0
+configparser>=6.0.0
+
+# Google API dependencies
+google-auth>=2.17.0
+google-auth-oauthlib>=1.0.0
+google-auth-httplib2>=0.2.0
+google-api-python-client>=2.88.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Optional: Nougat dependencies (for advanced visual processing)
+# Uncomment if you want to install Nougat automatically
+# Note: Requires Rust compiler for tokenizers
+# nougat-ocr==0.1.17
+# transformers==4.45.0
+# tokenizers==0.20.3
+# torch>=2.0.0
+# timm==0.5.4
+# orjson>=3.8.0
+# opencv-python-headless>=4.8.0
+# datasets[vision]>=2.14.0
+# lightning>=2.0.0,<2022
+# nltk>=3.8.0
+# python-Levenshtein>=0.20.0
+# sentencepiece>=0.1.99
+# sconf>=0.2.3
+# albumentations>=1.0.0
+# pypdf>=3.1.0
+# pypdfium2>=4.20.0
+
+# Development dependencies (optional)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
+# mypy>=1.0.0
