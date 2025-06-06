@@ -32,12 +32,17 @@ class WordDocumentGenerator:
         global bookmark_id_counter
         bookmark_id_counter = 0
     
-    def create_word_document_with_structure(self, structured_content_list, output_filepath, 
+    def create_word_document_with_structure(self, structured_content_list, output_filepath,
                                           image_folder_path, cover_page_data=None):
         """Create Word document with proper structure and formatting"""
         global bookmark_id_counter
         bookmark_id_counter = 0
-        
+
+        # Normalize paths to handle mixed separators
+        output_filepath = os.path.normpath(output_filepath)
+        if image_folder_path:
+            image_folder_path = os.path.normpath(image_folder_path)
+
         logger.info(f"--- Creating Word Document: {os.path.basename(output_filepath)} ---")
         
         doc = Document()
@@ -58,6 +63,12 @@ class WordDocumentGenerator:
         
         # Save document
         try:
+            # Ensure the output directory exists before saving
+            output_dir = os.path.dirname(output_filepath)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                logger.info(f"Created output directory: {output_dir}")
+
             doc.save(output_filepath)
             logger.info(f"Word document saved successfully: {output_filepath}")
             return True
@@ -419,7 +430,7 @@ class WordDocumentGenerator:
                 paragraph.italic = True
                 return
 
-            image_path = os.path.join(image_folder_path, image_data['filename'])
+            image_path = os.path.normpath(os.path.join(image_folder_path, image_data['filename']))
             logger.debug(f"Expected image path: {image_path}")
 
             if not os.path.exists(image_path):
@@ -580,6 +591,12 @@ class PDFConverter:
             return False
 
         try:
+            # Ensure the output directory exists before conversion
+            pdf_dir = os.path.dirname(pdf_filepath)
+            if pdf_dir and not os.path.exists(pdf_dir):
+                os.makedirs(pdf_dir, exist_ok=True)
+                logger.info(f"Created PDF output directory: {pdf_dir}")
+
             # Try using docx2pdf
             from docx2pdf import convert as convert_to_pdf_lib
 

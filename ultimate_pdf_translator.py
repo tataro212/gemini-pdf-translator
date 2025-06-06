@@ -1254,7 +1254,7 @@ def process_pdf_with_enhanced_capabilities(pdf_filepath, output_directory):
     try:
         # Step 1: Extract images with enhanced analysis
         logger.info("Step 1: Enhanced image extraction and analysis...")
-        image_folder = os.path.join(output_directory, "extracted_images")
+        image_folder = os.path.normpath(os.path.join(output_directory, "extracted_images"))
         raw_image_refs = extract_images_from_pdf(pdf_filepath, image_folder)
         enhanced_image_refs = enhance_existing_image_processing(raw_image_refs, image_folder)
 
@@ -2175,7 +2175,7 @@ def get_specific_output_dir_for_file(main_base_output_dir, source_pdf_filepath):
     if not main_base_output_dir:
         main_base_output_dir = os.path.dirname(source_pdf_filepath) if os.path.dirname(source_pdf_filepath) else os.getcwd()
         logger.warning(f"Κύριος φάκελος εξόδου δεν δόθηκε, χρησιμοποιείται ο: {main_base_output_dir}")
-    specific_output_dir = os.path.join(main_base_output_dir, f"{safe_subdir_name}_Μεταφρασμένο_{TARGET_LANGUAGE_CONFIG.replace(' ','_')}")
+    specific_output_dir = os.path.normpath(os.path.join(main_base_output_dir, f"{safe_subdir_name}_Μεταφρασμένο_{TARGET_LANGUAGE_CONFIG.replace(' ','_')}"))
     try:
         os.makedirs(specific_output_dir, exist_ok=True)
         return specific_output_dir
@@ -2272,7 +2272,7 @@ def extract_cover_page_from_pdf(pdf_filepath, output_folder):
 
         # Save cover page
         cover_filename = f"cover_page_{os.path.splitext(os.path.basename(pdf_filepath))[0]}.png"
-        cover_path = os.path.join(output_folder, cover_filename)
+        cover_path = os.path.normpath(os.path.join(output_folder, cover_filename))
         pix.save(cover_path)
 
         pdf_document.close()
@@ -2334,7 +2334,7 @@ def extract_images_from_pdf(pdf_filepath, output_image_folder):
                         image_ext = base_image["ext"]
                         image_count_on_page[page_index] += 1
                         image_filename = f"image_p{page_index+1}_{image_count_on_page[page_index]}.{image_ext}"
-                        image_save_path = os.path.join(output_image_folder, image_filename)
+                        image_save_path = os.path.normpath(os.path.join(output_image_folder, image_filename))
                         with open(image_save_path, "wb") as img_file: img_file.write(image_bytes)
                         ocr_text_original = ocr_image_text(image_save_path, lang=OCR_LANGUAGE) if PERFORM_OCR_ON_IMAGES else None
                         if ocr_text_original: quality_report_messages.append(f"INFO: OCR extracted from '{image_filename}'.")
@@ -4315,7 +4315,7 @@ async def translate_document_agent_async(
         word_output_filename = f"{base_original_filename}_({current_target_language})_FINAL.docx"; pdf_output_filename = f"{base_original_filename}_({current_target_language})_FINAL.pdf"
         final_images_output_path_abs = None
         if EXTRACT_IMAGES and all_extracted_image_refs:
-            final_images_output_path_abs = os.path.join(output_dir_for_this_file, output_image_folder_name)
+            final_images_output_path_abs = os.path.normpath(os.path.join(output_dir_for_this_file, output_image_folder_name))
             try:
                 os.makedirs(final_images_output_path_abs, exist_ok=True)
                 if os.path.exists(temp_image_dir_for_extraction) and os.listdir(temp_image_dir_for_extraction):
@@ -4326,7 +4326,7 @@ async def translate_document_agent_async(
                 final_images_output_path_abs = None
         
         with tempfile.TemporaryDirectory(prefix="trans_artefacts_") as temp_processing_dir:
-            temp_word_path = os.path.join(temp_processing_dir, word_output_filename); temp_pdf_path = os.path.join(temp_processing_dir, pdf_output_filename)
+            temp_word_path = os.path.normpath(os.path.join(temp_processing_dir, word_output_filename)); temp_pdf_path = os.path.normpath(os.path.join(temp_processing_dir, pdf_output_filename))
             
             word_created_successfully = create_word_document_with_structure(translated_structured_content, temp_word_path, final_images_output_path_abs if final_images_output_path_abs else temp_image_dir_for_extraction, cover_page_data)
             pdf_created_successfully = False
@@ -4335,13 +4335,13 @@ async def translate_document_agent_async(
                 time.sleep(1) if pdf_created_successfully else None
             
             if word_created_successfully:
-                final_word_path_local = os.path.join(output_dir_for_this_file, word_output_filename)
+                final_word_path_local = os.path.normpath(os.path.join(output_dir_for_this_file, word_output_filename))
                 try: shutil.move(temp_word_path, final_word_path_local)
                 except Exception as e_wmov: quality_report_messages.append(f"ERROR moving Word file: {e_wmov}"); logger.error(f"Error moving Word: {e_wmov}", exc_info=True); final_word_path_local = temp_word_path
             else: quality_report_messages.append(f"ERROR: Word creation failed for {os.path.basename(filepath)}.")
             
             if pdf_created_successfully:
-                final_pdf_path_local = os.path.join(output_dir_for_this_file, pdf_output_filename)
+                final_pdf_path_local = os.path.normpath(os.path.join(output_dir_for_this_file, pdf_output_filename))
                 try: shutil.move(temp_pdf_path, final_pdf_path_local)
                 except Exception as e_pmov: quality_report_messages.append(f"ERROR moving PDF file: {e_pmov}"); logger.error(f"Error moving PDF: {e_pmov}", exc_info=True); final_pdf_path_local = temp_pdf_path
             elif word_created_successfully : quality_report_messages.append(f"ERROR: PDF conversion failed for {os.path.basename(filepath)}.")

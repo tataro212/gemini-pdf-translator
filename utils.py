@@ -108,16 +108,18 @@ def choose_base_output_directory(initial_dir=None):
     return chosen_directory
 
 def get_specific_output_dir_for_file(main_base_output_dir, source_pdf_filepath):
-    """Create specific output directory for a PDF file"""
+    """Create specific output directory for a PDF file with proper path handling"""
     base_input_filename = os.path.splitext(os.path.basename(source_pdf_filepath))[0]
     safe_subdir_name = re.sub(r'[<>:"/\\|?*]', '_', base_input_filename)
     safe_subdir_name = safe_subdir_name[:100]
-    
+
     if not safe_subdir_name:
         safe_subdir_name = "translated_document"
-    
-    specific_output_dir = os.path.join(main_base_output_dir, safe_subdir_name)
-    
+
+    # Normalize paths to handle mixed separators
+    main_base_output_dir = os.path.normpath(main_base_output_dir)
+    specific_output_dir = os.path.normpath(os.path.join(main_base_output_dir, safe_subdir_name))
+
     try:
         os.makedirs(specific_output_dir, exist_ok=True)
         logger.info(f"Output directory ready: {specific_output_dir}")

@@ -92,11 +92,13 @@ class UltimatePDFTranslator:
             if not os.path.exists(output_dir_for_this_file):
                 os.makedirs(output_dir_for_this_file, exist_ok=True)
             
-            # Set up output paths
+            # Set up output paths with proper path normalization
             base_filename = os.path.splitext(os.path.basename(filepath))[0]
+            # Normalize the output directory path to fix mixed separators
+            output_dir_for_this_file = os.path.normpath(output_dir_for_this_file)
             image_folder = os.path.join(output_dir_for_this_file, "images")
-            word_output_path = os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx")
-            pdf_output_path = os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf")
+            word_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx"))
+            pdf_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf"))
             
             # Step 1: Extract images from PDF (with enhanced Nougat or fallback)
             if self.nougat_integration is None:
