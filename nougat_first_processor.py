@@ -17,6 +17,12 @@ from dataclasses import dataclass
 from enum import Enum
 import hashlib
 
+# Import structured document model
+from document_model import (
+    Document, Page, ContentBlock, Heading, Paragraph, Footnote, Table,
+    ListItem, MathematicalFormula, ContentType
+)
+
 logger = logging.getLogger(__name__)
 
 class VisualElementType(Enum):
@@ -157,6 +163,328 @@ class NougatFirstProcessor:
         except Exception as e:
             logger.error(f"❌ Nougat-first processing failed: {e}")
             raise
+
+    def process_document_structured(self, pdf_path: str, output_dir: str) -> Document:
+        """
+        NEW STRUCTURED APPROACH: Process document and return structured Document object.
+
+        This method implements the structured document model, parsing nougat output
+        into proper ContentBlock objects that preserve document structure.
+        """
+        logger.info(f"🏗️ Starting structured document processing: {os.path.basename(pdf_path)}")
+
+        try:
+            # Extract initial data using existing methods
+            text_blocks, visual_elements = self._extract_initial_data_pymupdf(pdf_path, output_dir)
+            toc_structure = self._extract_toc_nougat_first(pdf_path)
+            text_blocks = self._classify_semantic_roles_efficiently(text_blocks, toc_structure)
+
+            # Convert to structured document
+            document = self._convert_to_structured_document(text_blocks, toc_structure, pdf_path)
+
+            # Process visual elements and associate with document
+            processed_visual_elements = self._process_visual_elements_nougat_first(visual_elements, output_dir)
+            document.document_metadata['visual_elements'] = processed_visual_elements
+
+            logger.info(f"✅ Structured document created:")
+            logger.info(f"   • Pages: {len(document.pages)}")
+            logger.info(f"   • Total blocks: {len(document.get_all_content_blocks())}")
+            logger.info(f"   • Headings: {len(document.get_all_headings())}")
+            logger.info(f"   • Footnotes: {len(document.get_all_footnotes())}")
+
+            return document
+
+        except Exception as e:
+            logger.error(f"❌ Structured document processing failed: {e}")
+            raise
+
+    def _convert_to_structured_document(self, text_blocks: List[RichTextBlock],
+                                      toc_structure: Dict, pdf_path: str) -> Document:
+        """
+        Convert RichTextBlocks to structured Document with proper ContentBlock types.
+
+        This method implements the core parsing logic that classifies text into
+        headings, paragraphs, footnotes, tables, etc.
+        """
+        # Create document with title from filename
+        title = os.path.splitext(os.path.basename(pdf_path))[0]
+        document = Document(title=title)
+
+        # Group blocks by page
+        pages_dict = {}
+        for block in text_blocks:
+            page_num = block.page_num
+            if page_num not in pages_dict:
+                pages_dict[page_num] = Page(page_number=page_num)
+
+        # Process blocks and convert to structured content
+        current_paragraph_blocks = []
+
+        for block in text_blocks:
+            page = pages_dict[block.page_num]
+
+            # Convert RichTextBlock to appropriate ContentBlock
+            content_block = self._parse_text_block_to_content_block(block, toc_structure)
+
+            if content_block:
+                # Handle paragraph grouping
+                if isinstance(content_block, Paragraph):
+                    current_paragraph_blocks.append(content_block)
+                else:
+                    # Flush accumulated paragraphs
+                    if current_paragraph_blocks:
+                        merged_paragraph = self._merge_paragraph_blocks(current_paragraph_blocks)
+                        page.add_block(merged_paragraph)
+                        current_paragraph_blocks = []
+
+                    # Add the non-paragraph block
+                    page.add_block(content_block)
+
+        # Flush any remaining paragraphs
+        if current_paragraph_blocks:
+            last_page = pages_dict[current_paragraph_blocks[-1].page_num]
+            merged_paragraph = self._merge_paragraph_blocks(current_paragraph_blocks)
+            last_page.add_block(merged_paragraph)
+
+        # Add pages to document in order
+        for page_num in sorted(pages_dict.keys()):
+            document.add_page(pages_dict[page_num])
+
+        # Set document metadata
+        document.document_metadata.update({
+            'toc_structure': toc_structure,
+            'processing_method': 'nougat_first_structured',
+            'total_text_blocks': len(text_blocks)
+        })
+
+        return document
+
+    def _parse_text_block_to_content_block(self, block: RichTextBlock,
+                                         toc_structure: Dict) -> Optional[ContentBlock]:
+        """
+        Parse a RichTextBlock into the appropriate ContentBlock type.
+
+        This method implements the core classification logic using semantic roles,
+        font analysis, and content patterns to determine block types.
+        """
+        text = block.text.strip()
+        if not text:
+            return None
+
+        semantic_role = block.semantic_role.lower()
+
+        # Common fields for all content blocks
+        common_fields = {
+            'content': text,
+            'page_num': block.page_num,
+            'bbox': block.bbox,
+            'font_info': {
+                'font_name': block.font_name,
+                'font_size': block.font_size,
+                'font_weight': block.font_weight,
+                'font_style': block.font_style,
+                'color': block.color
+            }
+        }
+
+        # Heading detection
+        if semantic_role.startswith('h') and semantic_role[1:].isdigit():
+            level = int(semantic_role[1:])
+            return Heading(level=min(level, 6), **common_fields)
+
+        # Footnote detection
+        if self._is_footnote_text(text):
+            reference_id = self._extract_footnote_reference_id(text)
+            return Footnote(reference_id=reference_id, **common_fields)
+
+        # Table detection
+        if self._is_table_content(text):
+            return Table(**common_fields)
+
+        # List item detection
+        if semantic_role == 'list_item' or self._is_list_item(text):
+            list_level, is_ordered, item_number = self._parse_list_item(text)
+            return ListItem(
+                list_level=list_level,
+                is_ordered=is_ordered,
+                item_number=item_number,
+                **common_fields
+            )
+
+        # Mathematical formula detection
+        if self._is_mathematical_formula(text):
+            latex_repr = self._extract_latex_representation(text)
+            return MathematicalFormula(
+                formula_type='block' if len(text) > 50 else 'inline',
+                latex_representation=latex_repr,
+                **common_fields
+            )
+
+        # Default to paragraph
+        return Paragraph(**common_fields)
+
+    def _merge_paragraph_blocks(self, paragraph_blocks: List[Paragraph]) -> Paragraph:
+        """
+        Merge consecutive paragraph blocks into a single paragraph.
+
+        This addresses the paragraph break issue by properly combining
+        text blocks that belong to the same logical paragraph.
+        """
+        if not paragraph_blocks:
+            return None
+
+        if len(paragraph_blocks) == 1:
+            return paragraph_blocks[0]
+
+        # Combine content with paragraph breaks
+        combined_content = []
+        for i, para in enumerate(paragraph_blocks):
+            combined_content.append(para.content)
+            # Add paragraph break marker except for the last paragraph
+            if i < len(paragraph_blocks) - 1:
+                combined_content.append('[PARAGRAPH_BREAK]')
+
+        # Use properties from the first paragraph
+        first_para = paragraph_blocks[0]
+        merged_paragraph = Paragraph(
+            content=' '.join(combined_content),
+            page_num=first_para.page_num,
+            bbox=first_para.bbox,
+            font_info=first_para.font_info
+        )
+
+        return merged_paragraph
+
+    def _is_footnote_text(self, text: str) -> bool:
+        """Check if text appears to be a footnote"""
+        # Look for footnote patterns at the beginning
+        footnote_patterns = [
+            r'^\s*\[\d+\]',  # [1]
+            r'^\s*\(\d+\)',  # (1)
+            r'^\s*\d+\.',    # 1.
+            r'^\s*[¹²³⁴⁵⁶⁷⁸⁹⁰]+',  # Superscript numbers
+            r'^\s*\*+',      # Asterisks
+        ]
+
+        for pattern in footnote_patterns:
+            if re.match(pattern, text):
+                return True
+
+        # Check if text is at bottom of page and short
+        return len(text) < 300 and any(word in text.lower() for word in ['note:', 'see', 'cf.', 'ibid'])
+
+    def _extract_footnote_reference_id(self, text: str) -> str:
+        """Extract footnote reference ID from text"""
+        patterns = [
+            r'^\s*\[(\d+)\]',  # [1]
+            r'^\s*\((\d+)\)',  # (1)
+            r'^\s*(\d+)\.',    # 1.
+            r'^\s*([¹²³⁴⁵⁶⁷⁸⁹⁰]+)',  # Superscript numbers
+            r'^\s*(\*+)',      # Asterisks
+        ]
+
+        for pattern in patterns:
+            match = re.match(pattern, text)
+            if match:
+                return match.group(1)
+
+        return ""
+
+    def _is_table_content(self, text: str) -> bool:
+        """Check if text appears to be table content"""
+        # Look for table indicators
+        table_indicators = [
+            '|',  # Markdown table separator
+            '\t',  # Tab-separated values
+            '  +',  # Multiple spaces (column alignment)
+        ]
+
+        # Check for multiple table indicators
+        indicator_count = sum(1 for indicator in table_indicators if indicator in text)
+
+        # Also check for structured data patterns
+        lines = text.split('\n')
+        if len(lines) > 1:
+            # Check if multiple lines have similar structure
+            structured_lines = [line for line in lines if any(ind in line for ind in table_indicators)]
+            return len(structured_lines) >= 2
+
+        return indicator_count >= 2
+
+    def _is_list_item(self, text: str) -> bool:
+        """Check if text is a list item"""
+        list_patterns = [
+            r'^\s*[•\-\*]\s+',  # Bullet points
+            r'^\s*\d+[\.\)]\s+',  # Numbered lists
+            r'^\s*[a-zA-Z][\.\)]\s+',  # Lettered lists
+            r'^\s*[ivxlcdm]+[\.\)]\s+',  # Roman numerals
+        ]
+
+        for pattern in list_patterns:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+
+        return False
+
+    def _parse_list_item(self, text: str) -> Tuple[int, bool, Optional[int]]:
+        """Parse list item to extract level, type, and number"""
+        # Count leading whitespace for level
+        leading_spaces = len(text) - len(text.lstrip())
+        list_level = max(1, leading_spaces // 4 + 1)  # Assume 4 spaces per level
+
+        # Check if ordered list
+        ordered_patterns = [
+            r'^\s*(\d+)[\.\)]\s+',  # Numbered
+            r'^\s*([a-zA-Z])[\.\)]\s+',  # Lettered
+            r'^\s*([ivxlcdm]+)[\.\)]\s+',  # Roman numerals
+        ]
+
+        for pattern in ordered_patterns:
+            match = re.match(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    item_number = int(match.group(1))
+                    return list_level, True, item_number
+                except ValueError:
+                    return list_level, True, None
+
+        # Default to unordered list
+        return list_level, False, None
+
+    def _is_mathematical_formula(self, text: str) -> bool:
+        """Check if text contains mathematical formulas"""
+        math_indicators = [
+            r'\$.*\$',  # LaTeX math mode
+            r'\\[a-zA-Z]+',  # LaTeX commands
+            r'[∑∫∏∆∇]',  # Mathematical symbols
+            r'[αβγδεζηθικλμνξοπρστυφχψω]',  # Greek letters
+            r'[≤≥≠≈∞±]',  # Mathematical operators
+        ]
+
+        for pattern in math_indicators:
+            if re.search(pattern, text):
+                return True
+
+        return False
+
+    def _extract_latex_representation(self, text: str) -> str:
+        """Extract LaTeX representation from mathematical text"""
+        # Look for existing LaTeX delimiters
+        latex_patterns = [
+            r'\$\$(.*?)\$\$',  # Display math
+            r'\$(.*?)\$',      # Inline math
+        ]
+
+        for pattern in latex_patterns:
+            matches = re.findall(pattern, text, re.DOTALL)
+            if matches:
+                return matches[0].strip()
+
+        # If no delimiters, return the text if it looks like LaTeX
+        if any(cmd in text for cmd in ['\\frac', '\\sum', '\\int', '\\alpha']):
+            return text.strip()
+
+        return ""
     
     def _extract_initial_data_pymupdf(self, pdf_path: str, output_dir: str) -> Tuple[List[RichTextBlock], List[VisualElement]]:
         """

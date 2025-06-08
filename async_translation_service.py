@@ -40,6 +40,9 @@ except ImportError:
     MARKDOWN_PROCESSOR_AVAILABLE = False
     logging.warning("Markdown content processor not available")
 
+# Import structured document model
+from document_model import Document, Page, ContentBlock, Heading, Paragraph, Footnote, Table
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -470,6 +473,144 @@ class AsyncTranslationService:
                 logger.warning("⚠️ No headers found after processing - TOC may be empty")
 
         return result_items
+
+    async def translate_document_structured(self, document: Document, target_language: str) -> Document:
+        """
+        NEW STRUCTURED APPROACH: Translate a structured Document object.
+
+        This method operates on ContentBlock objects, preserving their type
+        and metadata while translating only the content text.
+        """
+        logger.info(f"🏗️ Starting structured document translation: {document.title}")
+        logger.info(f"   • Target language: {target_language}")
+        logger.info(f"   • Total blocks: {len(document.get_all_content_blocks())}")
+
+        # Create translation tasks from content blocks
+        tasks = self._create_tasks_from_content_blocks(document.get_all_content_blocks(), target_language)
+
+        if not tasks:
+            logger.warning("No translation tasks created from document")
+            return document
+
+        # Execute translations concurrently
+        translated_texts = await self.translate_batch_concurrent(tasks)
+
+        # Create new document with translated content
+        translated_document = self._apply_translations_to_document(document, tasks, translated_texts)
+
+        logger.info(f"✅ Structured document translation completed")
+        return translated_document
+
+    def _create_tasks_from_content_blocks(self, content_blocks: List[ContentBlock],
+                                        target_language: str) -> List[TranslationTask]:
+        """Create translation tasks from structured content blocks"""
+        tasks = []
+
+        for i, block in enumerate(content_blocks):
+            # Skip footnotes - they will be handled separately
+            if isinstance(block, Footnote):
+                continue
+
+            text = block.content.strip()
+            if not text:
+                continue
+
+            # Get context from surrounding blocks
+            context_before = ""
+            context_after = ""
+
+            # Look for context in previous blocks
+            for j in range(max(0, i-2), i):
+                prev_block = content_blocks[j]
+                if not isinstance(prev_block, Footnote):
+                    prev_text = prev_block.content.strip()
+                    if prev_text:
+                        context_before = prev_text[-200:] + " " + context_before
+
+            # Look for context in next blocks
+            for j in range(i+1, min(len(content_blocks), i+3)):
+                next_block = content_blocks[j]
+                if not isinstance(next_block, Footnote):
+                    next_text = next_block.content.strip()
+                    if next_text:
+                        context_after = context_after + " " + next_text[:200]
+
+            # Determine priority based on block type
+            priority = self._get_block_translation_priority(block)
+
+            # Create task with block ID for tracking
+            task = TranslationTask(
+                text=text,
+                target_language=target_language,
+                context_before=context_before.strip(),
+                context_after=context_after.strip(),
+                item_type=block.get_content_type().value,
+                priority=priority,
+                task_id=block.block_id  # Use block ID for tracking
+            )
+
+            tasks.append(task)
+
+        logger.info(f"📝 Created {len(tasks)} translation tasks from {len(content_blocks)} content blocks")
+        return tasks
+
+    def _get_block_translation_priority(self, block: ContentBlock) -> int:
+        """Determine translation priority based on content block type"""
+        if isinstance(block, Heading):
+            return 1  # Headings are highest priority for TOC
+        elif isinstance(block, Table):
+            return 1  # Tables need careful translation
+        elif isinstance(block, Paragraph):
+            return 2  # Paragraphs are medium priority
+        else:
+            return 3  # Other content is lower priority
+
+    def _apply_translations_to_document(self, original_document: Document,
+                                      tasks: List[TranslationTask],
+                                      translated_texts: List[str]) -> Document:
+        """Apply translated texts back to document structure"""
+        # Create mapping of block IDs to translated texts
+        translation_map = {}
+        for task, translated_text in zip(tasks, translated_texts):
+            translation_map[task.task_id] = translated_text
+
+        # Create new document with same structure
+        translated_document = Document(
+            title=original_document.title,
+            document_metadata=original_document.document_metadata.copy()
+        )
+
+        # Process each page
+        for original_page in original_document.pages:
+            translated_page = Page(
+                page_number=original_page.page_number,
+                page_metadata=original_page.page_metadata.copy()
+            )
+
+            # Process each block on the page
+            for block in original_page.content_blocks:
+                translated_block = self._translate_content_block(block, translation_map)
+                translated_page.add_block(translated_block)
+
+            translated_document.add_page(translated_page)
+
+        return translated_document
+
+    def _translate_content_block(self, block: ContentBlock,
+                               translation_map: Dict[str, str]) -> ContentBlock:
+        """Create a translated copy of a content block"""
+        # Get translated text if available
+        translated_text = translation_map.get(block.block_id, block.content)
+
+        # Create new block of the same type with translated content
+        block_dict = block.to_dict()
+        block_dict['content'] = translated_text
+
+        # Import the creation function
+        from document_model import create_content_block_from_dict
+        translated_block = create_content_block_from_dict(block_dict)
+
+        return translated_block if translated_block else block
 
 class PreemptiveImageFilter:
     """
