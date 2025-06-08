@@ -197,19 +197,20 @@ class UltimatePDFTranslator:
             
             # Step 8: Generate Word document
             logger.info("📄 Step 8: Generating Word document...")
-            word_success = document_generator.create_word_document_with_structure(
+            saved_word_filepath = document_generator.create_word_document_with_structure(
                 final_content, word_output_path, image_folder, cover_page_data
             )
-            
-            if not word_success:
+
+            if not saved_word_filepath:
                 raise Exception("Failed to create Word document")
-            
-            # Step 9: Convert to PDF
+
+            # Step 9: Convert to PDF using the exact path returned from save
             logger.info("📑 Step 9: Converting to PDF...")
-            pdf_success = pdf_converter.convert_word_to_pdf(word_output_path, pdf_output_path)
+            pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
 
             if not pdf_success:
                 logger.warning("⚠️ PDF conversion failed, but Word document was created successfully")
+                logger.info(f"💡 Word document available at: {saved_word_filepath}")
                 logger.info("💡 You can manually convert the Word document to PDF if needed")
 
             # Step 10: Upload to Google Drive (if configured)

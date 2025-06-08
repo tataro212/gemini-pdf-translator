@@ -33,6 +33,63 @@ def clean_text_of_markers(text):
         return ""
     return FOOTNOTE_MARKER_REGEX_FOR_CLEANING.sub("", text)
 
+def prepare_text_for_translation(text: str) -> str:
+    """
+    Replaces double newlines with a unique, non-translatable placeholder.
+    This preserves paragraph structure during translation.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    return text.replace('\n\n', ' [PARAGRAPH_BREAK] ')
+
+def sanitize_for_xml(text: str) -> str:
+    """
+    Removes illegal XML characters from a string, which can cause errors
+    in the python-docx library. This includes most control characters.
+    """
+    if not isinstance(text, str):
+        return text
+    # This regex removes control characters from \x00 to \x1F, but keeps
+    # tab (\x09), newline (\x0A), and carriage return (\x0D).
+    return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+
+def sanitize_filepath(filepath: str) -> str:
+    """
+    Sanitize filepath to handle problematic characters on Windows.
+    This is a centralized version of the filepath sanitization logic.
+    """
+    if not filepath:
+        return filepath
+
+    # Split path into directory and filename
+    directory = os.path.dirname(filepath)
+    filename = os.path.basename(filepath)
+
+    # Sanitize filename only (keep directory structure intact)
+    # Replace problematic characters with underscores
+    # Windows prohibited characters: < > : " / \ | ? *
+    # Additional problematic characters: + (can cause issues in some contexts)
+    sanitized_filename = re.sub(r'[<>:"/\\|?*+]', '_', filename)
+
+    # Replace multiple consecutive dashes with single dash
+    sanitized_filename = re.sub(r'-{2,}', '-', sanitized_filename)
+
+    # Replace multiple consecutive underscores with single underscore
+    sanitized_filename = re.sub(r'_{2,}', '_', sanitized_filename)
+
+    # Remove leading/trailing problematic characters
+    sanitized_filename = sanitized_filename.strip(' ._-')
+
+    # Ensure we still have a valid filename
+    if not sanitized_filename:
+        extension = os.path.splitext(filename)[1]
+        sanitized_filename = f'sanitized_document{extension}' if extension else 'sanitized_document'
+
+    # Reconstruct the full path
+    sanitized_path = os.path.join(directory, sanitized_filename)
+
+    return sanitized_path
+
 def get_cache_key(text, target_language, model_name):
     """Generate cache key for translation caching"""
     hasher = hashlib.sha256()
@@ -110,7 +167,26 @@ def choose_base_output_directory(initial_dir=None):
 def get_specific_output_dir_for_file(main_base_output_dir, source_pdf_filepath):
     """Create specific output directory for a PDF file with proper path handling"""
     base_input_filename = os.path.splitext(os.path.basename(source_pdf_filepath))[0]
-    safe_subdir_name = re.sub(r'[<>:"/\\|?*]', '_', base_input_filename)
+
+    # Enhanced path sanitization for Windows compatibility
+    # Remove or replace problematic characters
+    safe_subdir_name = base_input_filename
+
+    # Replace problematic characters with underscores
+    # Windows prohibited characters: < > : " / \ | ? *
+    # Additional problematic characters: + (can cause issues in some contexts)
+    safe_subdir_name = re.sub(r'[<>:"/\\|?*+]', '_', safe_subdir_name)
+
+    # Replace multiple consecutive dashes with single dash
+    safe_subdir_name = re.sub(r'-{2,}', '-', safe_subdir_name)
+
+    # Replace multiple consecutive underscores with single underscore
+    safe_subdir_name = re.sub(r'_{2,}', '_', safe_subdir_name)
+
+    # Remove leading/trailing spaces, dots, and underscores
+    safe_subdir_name = safe_subdir_name.strip(' ._-')
+
+    # Limit length to avoid path length issues
     safe_subdir_name = safe_subdir_name[:100]
 
     if not safe_subdir_name:

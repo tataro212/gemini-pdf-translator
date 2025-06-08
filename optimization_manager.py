@@ -9,6 +9,7 @@ import logging
 import re
 from collections import defaultdict
 from config_manager import config_manager
+from utils import prepare_text_for_translation
 
 logger = logging.getLogger(__name__)
 
@@ -163,7 +164,9 @@ class SmartGroupingProcessor:
         for item in group:
             text = item.get('text', '').strip()
             if text:
-                combined_texts.append(text)
+                # Apply paragraph placeholder system to preserve paragraph structure
+                prepared_text = prepare_text_for_translation(text)
+                combined_texts.append(prepared_text)
 
         # Combine with separator
         combined_text = self.group_separator.join(combined_texts)

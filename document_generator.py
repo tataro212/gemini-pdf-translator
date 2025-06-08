@@ -14,6 +14,7 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 from config_manager import config_manager
+from utils import sanitize_for_xml, sanitize_filepath
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,8 @@ class WordDocumentGenerator:
         """Reset the global bookmark counter"""
         global bookmark_id_counter
         bookmark_id_counter = 0
+
+
     
     def create_word_document_with_structure(self, structured_content_list, output_filepath,
                                           image_folder_path, cover_page_data=None):
@@ -63,18 +66,23 @@ class WordDocumentGenerator:
         
         # Save document
         try:
+            # Use centralized sanitization from utils
+            sanitized_filepath = sanitize_filepath(output_filepath)
+
             # Ensure the output directory exists before saving
-            output_dir = os.path.dirname(output_filepath)
+            output_dir = os.path.dirname(sanitized_filepath)
             if output_dir and not os.path.exists(output_dir):
                 os.makedirs(output_dir, exist_ok=True)
                 logger.info(f"Created output directory: {output_dir}")
 
-            doc.save(output_filepath)
-            logger.info(f"Word document saved successfully: {output_filepath}")
-            return True
+            doc.save(sanitized_filepath)
+            logger.info(f"Word document saved successfully: {sanitized_filepath}")
+            # Return the actual file path used for saving
+            return sanitized_filepath
         except Exception as e:
             logger.error(f"Error saving Word document: {e}")
-            return False
+            logger.error(f"Attempted path: {output_filepath}")
+            return None
     
     def _add_cover_page(self, doc, cover_page_data, image_folder_path):
         """Add cover page to document"""
@@ -99,8 +107,9 @@ class WordDocumentGenerator:
     def _add_table_of_contents(self, doc, structured_content_list):
         """Add enhanced table of contents with professional formatting"""
         try:
-            # Add TOC title with enhanced styling
-            toc_title = doc.add_heading(self.word_settings['toc_title'], level=1)
+            # Add TOC title with enhanced styling and sanitization
+            safe_toc_title = sanitize_for_xml(self.word_settings['toc_title'])
+            toc_title = doc.add_heading(safe_toc_title, level=1)
             toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
             # Add decorative line under title
@@ -304,6 +313,9 @@ class WordDocumentGenerator:
             level = heading['level']
             estimated_page = heading['estimated_page']
 
+            # Sanitize text for XML compatibility
+            safe_text = sanitize_for_xml(text)
+
             # Create TOC paragraph
             toc_paragraph = doc.add_paragraph()
             toc_paragraph.style = 'Normal'
@@ -320,7 +332,7 @@ class WordDocumentGenerator:
                 number_run.font.color.rgb = RGBColor(0, 0, 128)  # Dark blue
 
             # Add heading text
-            text_run = toc_paragraph.add_run(text)
+            text_run = toc_paragraph.add_run(safe_text)
             if level == 1:
                 text_run.bold = True
                 text_run.font.size = Pt(12)
@@ -346,70 +358,126 @@ class WordDocumentGenerator:
             logger.warning(f"Could not add enhanced TOC entry: {e}")
     
     def _add_content_item(self, doc, item, image_folder_path):
-        """Add a single content item to the document"""
+        """Add a single content item to the document with improved image placement"""
         item_type = item.get('type', 'paragraph')
         text_content = item.get('text', '').strip()
-        
+
         if item_type == 'image':
-            self._add_image_to_doc(doc, item, image_folder_path)
+            # Skip standalone image items - they will be handled by associated text
+            logger.debug(f"Skipping standalone image item: {item.get('filename')} - will be placed with associated text")
+            return
         elif text_content:
+            # Add images that should appear before this text
+            self._add_associated_images(doc, item, image_folder_path, placement='before')
+
+            # Add the text content
             if item_type in ['h1', 'h2', 'h3']:
                 self._add_heading(doc, text_content, item_type, item)
             elif item_type == 'list_item':
                 self._add_list_item(doc, text_content, item)
             else:
                 self._add_paragraph(doc, text_content, item)
+
+            # Add images that should appear after this text
+            self._add_associated_images(doc, item, image_folder_path, placement='after')
+
+    def _add_associated_images(self, doc, text_item, image_folder_path, placement='after'):
+        """Add images associated with a text item"""
+        associated_images = text_item.get('_associated_images', [])
+
+        if not associated_images:
+            return
+
+        images_added = 0
+        for image_info in associated_images:
+            image_placement = image_info.get('placement', 'after')
+
+            # Only add images that match the requested placement
+            if image_placement == placement:
+                image_item = image_info.get('image_item')
+                if image_item:
+                    logger.debug(f"Adding associated image {image_item.get('filename')} {placement} text")
+                    self._add_image_to_doc(doc, image_item, image_folder_path)
+                    images_added += 1
+
+        if images_added > 0:
+            logger.debug(f"Added {images_added} images {placement} text content")
     
     def _add_heading(self, doc, text_content, heading_type, item_data):
-        """Add heading with proper formatting"""
+        """Add heading with proper formatting and sanitization"""
         try:
             level = int(heading_type[1])  # Extract level from h1, h2, h3
-            heading = doc.add_heading(text_content, level=level)
-            
+            # Sanitize text content for XML compatibility
+            safe_text = sanitize_for_xml(text_content)
+            heading = doc.add_heading(safe_text, level=level)
+
             # Apply styling if enabled
             if self.word_settings['apply_styles_to_headings']:
                 heading.paragraph_format.space_before = Pt(self.word_settings['heading_space_before_pt'])
-                
+
                 # Add bookmark for TOC navigation
                 bookmark_name = f"heading_{bookmark_id_counter}"
                 self._add_bookmark_to_paragraph(heading, bookmark_name)
-                
+
         except Exception as e:
             logger.warning(f"Could not add heading: {e}")
             # Fallback to regular paragraph
             self._add_paragraph(doc, text_content, item_data)
     
     def _add_paragraph(self, doc, text_content, item_data):
-        """Add paragraph with proper formatting"""
+        """Add paragraph with proper formatting, sanitization, and placeholder handling"""
+        try:
+            # Sanitize text content for XML compatibility
+            safe_text = sanitize_for_xml(text_content)
+
+            # Handle paragraph placeholders - split by placeholder and add each as separate paragraph
+            if '[PARAGRAPH_BREAK]' in safe_text:
+                paragraphs = safe_text.split('[PARAGRAPH_BREAK]')
+                for para_text in paragraphs:
+                    para_text = para_text.strip()
+                    if para_text:  # Only add non-empty paragraphs
+                        self._add_single_paragraph(doc, para_text)
+            else:
+                # No placeholders, add as single paragraph
+                self._add_single_paragraph(doc, safe_text)
+
+        except Exception as e:
+            logger.warning(f"Could not add paragraph: {e}")
+
+    def _add_single_paragraph(self, doc, text_content):
+        """Add a single paragraph with styling"""
         try:
             paragraph = doc.add_paragraph(text_content)
-            
+
             # Apply styling if enabled
             if self.word_settings['apply_styles_to_paragraphs']:
                 paragraph.paragraph_format.space_after = Pt(self.word_settings['paragraph_space_after_pt'])
-                
+
                 # Apply first line indent if configured
                 if self.word_settings['paragraph_first_line_indent_inches'] > 0:
                     paragraph.paragraph_format.first_line_indent = Inches(
                         self.word_settings['paragraph_first_line_indent_inches']
                     )
-                
+
         except Exception as e:
-            logger.warning(f"Could not add paragraph: {e}")
+            logger.warning(f"Could not add single paragraph: {e}")
     
     def _add_list_item(self, doc, text_content, item_data):
-        """Add list item with proper formatting"""
+        """Add list item with proper formatting and sanitization"""
         try:
             # Remove list marker from text if present
             import re
             clean_text = re.sub(r'^\s*([*\-•◦∙➢➣►]|(\d{1,2}[\.\)])|([a-zA-Z][\.\)])|(\((?:[ivxlcdm]+|[a-zA-Z]|\d{1,2})\)))\s+', '', text_content)
-            
-            paragraph = doc.add_paragraph(clean_text, style='List Bullet')
-            
+
+            # Sanitize text content for XML compatibility
+            safe_text = sanitize_for_xml(clean_text)
+
+            paragraph = doc.add_paragraph(safe_text, style='List Bullet')
+
             # Apply styling if enabled
             if self.word_settings['apply_styles_to_paragraphs']:
                 paragraph.paragraph_format.left_indent = Inches(self.word_settings['list_indent_per_level_inches'])
-                
+
         except Exception as e:
             logger.warning(f"Could not add list item: {e}")
             # Fallback to regular paragraph
@@ -591,8 +659,11 @@ class PDFConverter:
             return False
 
         try:
+            # Sanitize the PDF filepath to handle problematic characters
+            sanitized_pdf_filepath = self._sanitize_pdf_filepath(pdf_filepath)
+
             # Ensure the output directory exists before conversion
-            pdf_dir = os.path.dirname(pdf_filepath)
+            pdf_dir = os.path.dirname(sanitized_pdf_filepath)
             if pdf_dir and not os.path.exists(pdf_dir):
                 os.makedirs(pdf_dir, exist_ok=True)
                 logger.info(f"Created PDF output directory: {pdf_dir}")
@@ -602,13 +673,13 @@ class PDFConverter:
 
             # Perform conversion
             logger.debug("Starting PDF conversion...")
-            convert_to_pdf_lib(word_filepath, pdf_filepath)
+            convert_to_pdf_lib(word_filepath, sanitized_pdf_filepath)
 
             # Verify output file was created and has reasonable size
-            if os.path.exists(pdf_filepath):
-                file_size = os.path.getsize(pdf_filepath)
+            if os.path.exists(sanitized_pdf_filepath):
+                file_size = os.path.getsize(sanitized_pdf_filepath)
                 if file_size > 1000:  # At least 1KB
-                    logger.info(f"✅ PDF conversion successful: {pdf_filepath} ({file_size:,} bytes)")
+                    logger.info(f"✅ PDF conversion successful: {sanitized_pdf_filepath} ({file_size:,} bytes)")
                     return True
                 else:
                     logger.error(f"❌ PDF file created but appears corrupted (size: {file_size} bytes)")
@@ -625,6 +696,40 @@ class PDFConverter:
             logger.error(f"❌ PDF conversion failed: {e}")
             self._diagnose_pdf_error(e)
             return False
+
+    def _sanitize_pdf_filepath(self, filepath):
+        """Sanitize PDF filepath to handle problematic characters on Windows"""
+        import re
+
+        # Split path into directory and filename
+        directory = os.path.dirname(filepath)
+        filename = os.path.basename(filepath)
+
+        # Sanitize filename only (keep directory structure intact)
+        # Replace problematic characters with underscores
+        sanitized_filename = re.sub(r'[<>:"/\\|?*+]', '_', filename)
+
+        # Replace multiple consecutive dashes with single dash
+        sanitized_filename = re.sub(r'-{2,}', '-', sanitized_filename)
+
+        # Replace multiple consecutive underscores with single underscore
+        sanitized_filename = re.sub(r'_{2,}', '_', sanitized_filename)
+
+        # Remove leading/trailing problematic characters
+        sanitized_filename = sanitized_filename.strip(' ._-')
+
+        # Ensure we still have a valid filename
+        if not sanitized_filename or sanitized_filename == '.pdf':
+            sanitized_filename = 'translated_document.pdf'
+
+        # Reconstruct the full path
+        sanitized_path = os.path.join(directory, sanitized_filename)
+
+        # Log if sanitization occurred
+        if sanitized_path != filepath:
+            logger.info(f"Sanitized PDF filepath: {filepath} -> {sanitized_path}")
+
+        return sanitized_path
 
     def _suggest_pdf_alternatives(self):
         """Suggest alternative PDF conversion methods"""
