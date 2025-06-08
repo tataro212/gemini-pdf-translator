@@ -24,6 +24,22 @@ except ImportError:
     TENACITY_AVAILABLE = False
     logging.warning("Tenacity not available - using basic retry logic")
 
+# Import markdown translator (with fallback if not available)
+try:
+    from markdown_aware_translator import markdown_translator
+    MARKDOWN_AWARE_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AWARE_AVAILABLE = False
+    logging.warning("Markdown-aware translator not available")
+
+# Import markdown content processor
+try:
+    from markdown_content_processor import markdown_processor
+    MARKDOWN_PROCESSOR_AVAILABLE = True
+except ImportError:
+    MARKDOWN_PROCESSOR_AVAILABLE = False
+    logging.warning("Markdown content processor not available")
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -439,6 +455,20 @@ class AsyncTranslationService:
                     result_items.append(item.copy())
 
         logger.info(f"✅ Async translation completed: {task_index} items translated")
+
+        # Post-process translated content to convert Markdown back to structured format
+        if MARKDOWN_PROCESSOR_AVAILABLE:
+            logger.info("🔄 Post-processing translated Markdown content...")
+            result_items = markdown_processor.process_translated_content_items(result_items)
+
+            # Validate the structured content
+            validation_stats = markdown_processor.validate_structured_content(result_items)
+
+            if validation_stats['total_headers'] > 0:
+                logger.info(f"✅ Found {validation_stats['total_headers']} headers for TOC generation")
+            else:
+                logger.warning("⚠️ No headers found after processing - TOC may be empty")
+
         return result_items
 
 class PreemptiveImageFilter:

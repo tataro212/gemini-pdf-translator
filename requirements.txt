@@ -15,6 +15,9 @@ google-api-python-client>=2.88.0
 pandas>=2.0.0
 numpy>=1.24.0
 
+# Markdown processing
+markdown-it-py>=3.0.0
+
 # Optional: Nougat dependencies (for advanced visual processing)
 # Uncomment if you want to install Nougat automatically
 # Note: Requires Rust compiler for tokenizers

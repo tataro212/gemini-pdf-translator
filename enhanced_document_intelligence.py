@@ -380,9 +380,147 @@ class SemanticContentGrouper:
         
         return list(set(cross_refs))  # Remove duplicates
 
+class DocumentTextRestructurer:
+    """Restructures extracted PDF text by separating main content from footnotes and metadata"""
+
+    def __init__(self):
+        self.footnote_patterns = [
+            r'^\d+\s+',  # Numbered footnotes at start of line
+            r'^\*+\s+',  # Asterisk footnotes
+            r'^\[\d+\]\s*',  # Bracketed numbers
+            r'^\(\d+\)\s*',  # Parenthesized numbers
+            r'footnote\s*:?\s*',  # Explicit footnote labels
+            r'note\s*:?\s*'  # Note labels
+        ]
+
+        self.header_footer_patterns = [
+            r'^\s*page\s+\d+\s*$',  # Page numbers
+            r'^\s*\d+\s*$',  # Standalone numbers
+            r'copyright\s*©',  # Copyright notices
+            r'confidential',  # Confidentiality markers
+            r'draft\s*v?\d*',  # Draft markers
+            r'www\.',  # URLs
+            r'http[s]?://',  # URLs
+            r'@\w+\.',  # Email patterns
+        ]
+
+    def analyze_and_restructure_text(self, page_text: str) -> Dict[str, any]:
+        """
+        Analyze and restructure text from a PDF page, separating main content from footnotes.
+
+        Args:
+            page_text: Raw text extracted from a PDF page
+
+        Returns:
+            Dictionary with 'main_content' and 'footnotes' keys
+        """
+        if not page_text or not page_text.strip():
+            return {"main_content": "", "footnotes": []}
+
+        try:
+            # Import here to avoid circular imports
+            from translation_service import translation_service
+
+            # Create the enhanced prompt for AI analysis
+            analysis_prompt = self._create_text_analysis_prompt(page_text)
+
+            # Use AI to analyze and restructure the text
+            response = translation_service.gemini_service.generate_content(analysis_prompt)
+
+            if response and hasattr(response, 'text'):
+                try:
+                    # Parse the JSON response
+                    import json
+                    result = json.loads(response.text.strip())
+
+                    # Validate the response structure
+                    if isinstance(result, dict) and 'main_content' in result and 'footnotes' in result:
+                        # Ensure footnotes is a list
+                        if not isinstance(result['footnotes'], list):
+                            result['footnotes'] = []
+
+                        logger.info(f"✅ Text restructured: {len(result['footnotes'])} footnotes separated")
+                        return result
+                    else:
+                        logger.warning("AI response missing required keys, falling back to heuristic method")
+                        return self._fallback_text_restructuring(page_text)
+
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse AI response as JSON: {e}, falling back to heuristic method")
+                    return self._fallback_text_restructuring(page_text)
+            else:
+                logger.warning("No response from AI service, falling back to heuristic method")
+                return self._fallback_text_restructuring(page_text)
+
+        except Exception as e:
+            logger.error(f"Error in AI text analysis: {e}, falling back to heuristic method")
+            return self._fallback_text_restructuring(page_text)
+
+    def _create_text_analysis_prompt(self, page_text: str) -> str:
+        """Create an enhanced prompt for AI-powered text analysis"""
+        return f"""You are a document structure analyst. The following text was extracted from a single page of a PDF and may contain a mix of main content, headers, footers, page numbers, and footnotes.
+
+Your task is to intelligently separate these elements.
+
+**INSTRUCTIONS:**
+1. Identify the primary body text of the document.
+2. Identify any text that appears to be a footnote or endnote (often starting with a number or symbol).
+3. Identify any text that is a header, footer, or page number.
+4. Return a JSON object with two keys:
+   - "main_content": A string containing only the main body text, with logical paragraph breaks.
+   - "footnotes": An array of strings, where each string is a distinct footnote you identified.
+
+If no footnotes are found, the "footnotes" array should be empty. Discard all headers, footers, and page numbers.
+
+**IMPORTANT:** Return ONLY the JSON object, no additional text or explanation.
+
+Here is the page text:
+
+{page_text}"""
+
+    def _fallback_text_restructuring(self, page_text: str) -> Dict[str, any]:
+        """Fallback heuristic method for text restructuring when AI fails"""
+        lines = page_text.split('\n')
+        main_content_lines = []
+        footnotes = []
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check if line is a footnote
+            is_footnote = False
+            for pattern in self.footnote_patterns:
+                if re.match(pattern, line, re.IGNORECASE):
+                    footnotes.append(line)
+                    is_footnote = True
+                    break
+
+            # Check if line is header/footer
+            if not is_footnote:
+                is_header_footer = False
+                for pattern in self.header_footer_patterns:
+                    if re.search(pattern, line, re.IGNORECASE):
+                        is_header_footer = True
+                        break
+
+                # If it's not a header/footer, add to main content
+                if not is_header_footer:
+                    main_content_lines.append(line)
+
+        # Join main content with proper paragraph breaks
+        main_content = '\n\n'.join(main_content_lines) if main_content_lines else ""
+
+        logger.info(f"📝 Heuristic restructuring: {len(footnotes)} footnotes separated")
+        return {
+            "main_content": main_content,
+            "footnotes": footnotes
+        }
+
 class CrossReferencePreserver:
     """Preserves cross-references during translation"""
-    
+
     def __init__(self):
         self.reference_patterns = {
             'figure': r'\b(figure|fig\.?)\s+(\d+)\b',
@@ -392,7 +530,7 @@ class CrossReferencePreserver:
             'equation': r'\b(equation|eq\.?)\s+(\d+)\b',
             'appendix': r'\b(appendix|app\.?)\s+([a-z])\b'
         }
-        
+
         self.reference_map = {}  # Maps original refs to translated refs
     
     def extract_references(self, content_items: List[Dict]) -> Dict[str, List[str]]:
@@ -439,8 +577,9 @@ def main():
     """Test the enhanced document intelligence"""
     print("🧠 Enhanced Document Intelligence Module")
     print("✅ Advanced content classification")
-    print("✅ Semantic content grouping") 
+    print("✅ Semantic content grouping")
     print("✅ Cross-reference preservation")
+    print("✅ Document text restructuring (footnote separation)")
     print("✅ Zero compromise to existing functionality")
 
 if __name__ == "__main__":

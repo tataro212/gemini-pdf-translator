@@ -18,6 +18,14 @@ from utils import get_cache_key
 
 logger = logging.getLogger(__name__)
 
+# Import markdown translator (with fallback if not available)
+try:
+    from markdown_aware_translator import markdown_translator
+    MARKDOWN_AWARE_AVAILABLE = True
+except ImportError:
+    MARKDOWN_AWARE_AVAILABLE = False
+    logger.warning("Markdown-aware translator not available")
+
 class TranslationCache:
     """Manages translation caching functionality"""
     
@@ -325,13 +333,33 @@ class TranslationService:
     
     async def translate_text(self, text, target_language=None, style_guide="",
                            prev_context="", next_context="", item_type="text block"):
-        """Translate a single text item with advanced caching"""
+        """Translate a single text item with advanced caching and Markdown awareness"""
 
         if not self.model:
             raise Exception("Translation service not properly initialized - no API key")
 
         if target_language is None:
             target_language = self.translation_settings['target_language']
+
+        # Check if content is Markdown and use appropriate translation method
+        if MARKDOWN_AWARE_AVAILABLE and markdown_translator.is_markdown_content(text):
+            logger.debug("🔄 Using Markdown-aware translation")
+
+            # Create async wrapper for this translation service
+            async def translate_func(content, lang, style, prev_ctx, next_ctx, content_type):
+                return await self._translate_raw_text(content, lang, style, prev_ctx, next_ctx, content_type)
+
+            return await markdown_translator.translate_markdown_content(
+                text, translate_func, target_language, prev_context, next_context
+            )
+
+        # Use standard translation for non-Markdown content
+        return await self._translate_raw_text(text, target_language, style_guide,
+                                            prev_context, next_context, item_type)
+
+    async def _translate_raw_text(self, text, target_language, style_guide="",
+                                prev_context="", next_context="", item_type="text block"):
+        """Internal method for raw text translation (without Markdown processing)"""
 
         # Check advanced cache first if available
         if self.use_advanced_cache and self.advanced_cache:
@@ -350,36 +378,36 @@ class TranslationService:
         if cached_result:
             logger.debug("Using basic cached translation")
             return cached_result
-        
+
         # Get glossary terms
         glossary_terms = self.glossary.get_glossary_terms_in_text(text)
-        
+
         # Generate prompt
         prompt = self.prompt_generator.generate_translation_prompt(
-            text, target_language, style_guide, glossary_terms, 
+            text, target_language, style_guide, glossary_terms,
             prev_context, next_context, item_type
         )
-        
+
         # Wait for quota if needed
         while not self.quota_manager.can_make_request():
             await asyncio.sleep(1)
-        
+
         # Make translation request with retry
         async def make_request():
             self.quota_manager.record_request()
-            
+
             response = await self.model.generate_content_async(
                 prompt,
                 generation_config=genai.types.GenerationConfig(
                     temperature=self.gemini_settings['temperature']
                 )
             )
-            
+
             if response and response.text:
                 return response.text.strip()
             else:
                 raise Exception("Empty response from translation API")
-        
+
         try:
             translation = await self.error_recovery.execute_with_retry(make_request)
 
@@ -395,11 +423,18 @@ class TranslationService:
                 )
 
             return translation
-            
+
         except Exception as e:
             logger.error(f"Translation failed for text: {text[:100]}... Error: {e}")
             raise
-    
+
+    def translate_text_sync(self, text, target_language=None, style_guide="",
+                          prev_context="", next_context="", item_type="text block"):
+        """Synchronous wrapper for translate_text (for compatibility)"""
+        return asyncio.run(self.translate_text(
+            text, target_language, style_guide, prev_context, next_context, item_type
+        ))
+
     def save_caches(self):
         """Save all caches to disk"""
         self.cache.save_cache()

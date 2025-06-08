@@ -20,6 +20,7 @@ from document_generator import document_generator, pdf_converter
 from drive_uploader import drive_uploader
 from nougat_integration import NougatIntegration  # Enhanced Nougat integration
 from nougat_only_integration import NougatOnlyIntegration  # NOUGAT-ONLY mode
+from enhanced_document_intelligence import DocumentTextRestructurer  # Footnote handling
 from utils import (
     choose_input_path, choose_base_output_directory,
     get_specific_output_dir_for_file, estimate_translation_cost,
@@ -35,6 +36,7 @@ class UltimatePDFTranslator:
         self.pdf_parser = PDFParser()
         self.content_extractor = StructuredContentExtractor()
         self.image_analyzer = SmartImageAnalyzer()
+        self.text_restructurer = DocumentTextRestructurer()  # For footnote handling
         self.quality_report_messages = []
 
         # Check for NOUGAT-ONLY mode preference
@@ -161,9 +163,13 @@ class UltimatePDFTranslator:
             structured_content = self.content_extractor.extract_structured_content_from_pdf(
                 filepath, extracted_images
             )
-            
+
             if not structured_content:
                 raise Exception("No content could be extracted from the PDF")
+
+            # Step 3.5: Restructure text to separate footnotes
+            logger.info("🔧 Step 3.5: Restructuring text and separating footnotes...")
+            structured_content = self._restructure_content_text(structured_content)
             
             # Step 4: Analyze images for translation
             logger.info("🔍 Step 4: Analyzing images...")
@@ -266,7 +272,51 @@ class UltimatePDFTranslator:
                         item['translation_needed'] = True
                     else:
                         item['translation_needed'] = False
-    
+
+    def _restructure_content_text(self, structured_content):
+        """Restructure text content to separate footnotes from main content"""
+        restructured_content = []
+        footnotes_collected = []
+
+        for item in structured_content:
+            if item.get('type') in ['paragraph', 'text'] and item.get('text'):
+                # Apply text restructuring to separate footnotes
+                try:
+                    restructured = self.text_restructurer.analyze_and_restructure_text(item['text'])
+
+                    # Update the main content
+                    if restructured['main_content']:
+                        item['text'] = restructured['main_content']
+                        restructured_content.append(item)
+
+                    # Collect footnotes
+                    if restructured['footnotes']:
+                        for footnote in restructured['footnotes']:
+                            footnote_item = {
+                                'type': 'footnote',
+                                'text': footnote,
+                                'page_num': item.get('page_num', 0),
+                                'source_block': item.get('block_num', 0)
+                            }
+                            footnotes_collected.append(footnote_item)
+
+                        logger.info(f"📝 Separated {len(restructured['footnotes'])} footnotes from page {item.get('page_num', 'unknown')}")
+
+                except Exception as e:
+                    logger.warning(f"Failed to restructure text on page {item.get('page_num', 'unknown')}: {e}")
+                    # Keep original item if restructuring fails
+                    restructured_content.append(item)
+            else:
+                # Keep non-text items as-is
+                restructured_content.append(item)
+
+        # Add footnotes at the end if any were found
+        if footnotes_collected:
+            logger.info(f"📋 Total footnotes collected: {len(footnotes_collected)}")
+            restructured_content.extend(footnotes_collected)
+
+        return restructured_content
+
     async def _translate_batches(self, optimized_batches, target_language, style_guide):
         """Translate optimized batches of content"""
         translated_items = []
