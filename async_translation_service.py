@@ -16,6 +16,14 @@ from dataclasses import dataclass
 from config_manager import config_manager
 from advanced_caching import advanced_cache_manager
 
+# Optional imports for enhanced error handling
+try:
+    from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+    TENACITY_AVAILABLE = True
+except ImportError:
+    TENACITY_AVAILABLE = False
+    logging.warning("Tenacity not available - using basic retry logic")
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -223,30 +231,85 @@ class AsyncTranslationService:
         return task_results
     
     async def _translate_single_task(self, task: TranslationTask) -> str:
-        """Translate a single task using the Gemini API"""
+        """Translate a single task using the Gemini API with robust error handling"""
+        if TENACITY_AVAILABLE:
+            return await self._translate_with_tenacity(task)
+        else:
+            return await self._translate_with_basic_retry(task)
+
+    async def _translate_with_tenacity(self, task: TranslationTask) -> str:
+        """Translate with tenacity retry logic"""
+        @retry(
+            stop=stop_after_attempt(3),
+            wait=wait_exponential(multiplier=1, min=4, max=10),
+            retry=retry_if_exception_type((ConnectionError, TimeoutError, Exception))
+        )
+        async def _do_translation():
+            try:
+                # Import here to avoid circular imports
+                from translation_service import translation_service
+
+                # Use existing translation service but with async wrapper
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    translation_service.translate_text_sync,
+                    task.text,
+                    task.target_language,
+                    "",  # style_guide
+                    task.context_before,
+                    task.context_after,
+                    task.item_type
+                )
+
+                self.stats['api_calls'] += 1
+                logger.debug(f"API translation completed for task {task.task_id}")
+                return result
+
+            except Exception as e:
+                logger.warning(f"Translation attempt failed for task {task.task_id}: {e}")
+                raise
+
         try:
-            # Import here to avoid circular imports
-            from translation_service import translation_service
-            
-            # Use existing translation service but with async wrapper
-            result = await asyncio.get_event_loop().run_in_executor(
-                None,
-                translation_service.translate_text_sync,
-                task.text,
-                task.target_language,
-                "",  # style_guide
-                task.context_before,
-                task.context_after,
-                task.item_type
-            )
-            
-            self.stats['api_calls'] += 1
-            logger.debug(f"API translation completed for task {task.task_id}")
-            return result
-            
+            return await _do_translation()
         except Exception as e:
-            logger.error(f"API translation failed for task {task.task_id}: {e}")
+            logger.error(f"All retry attempts failed for task {task.task_id}: {e}")
             raise
+
+    async def _translate_with_basic_retry(self, task: TranslationTask) -> str:
+        """Translate with basic retry logic when tenacity is not available"""
+        max_retries = 3
+        base_delay = 2.0
+
+        for attempt in range(max_retries):
+            try:
+                # Import here to avoid circular imports
+                from translation_service import translation_service
+
+                # Use existing translation service but with async wrapper
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    translation_service.translate_text_sync,
+                    task.text,
+                    task.target_language,
+                    "",  # style_guide
+                    task.context_before,
+                    task.context_after,
+                    task.item_type
+                )
+
+                self.stats['api_calls'] += 1
+                logger.debug(f"API translation completed for task {task.task_id}")
+                return result
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"Translation attempt {attempt + 1} failed for task {task.task_id}: {e}")
+                    logger.info(f"Retrying in {delay} seconds...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"All retry attempts failed for task {task.task_id}: {e}")
+                    raise
     
     def _generate_cache_key(self, task: TranslationTask) -> str:
         """Generate cache key for memory cache"""

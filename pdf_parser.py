@@ -378,12 +378,97 @@ class PDFParser:
 
             for candidate in table_candidates:
                 if self._validate_table_structure(candidate, min_columns, min_rows):
-                    table_areas.append(candidate)
+                    # ENHANCED: Filter out assessment text that looks like tables
+                    if not self._is_assessment_text_misclassified_as_table(candidate, page):
+                        table_areas.append(candidate)
+                    else:
+                        logger.debug(f"Filtered out assessment text misclassified as table: {candidate.get('sample_text', '')[:50]}...")
 
         except Exception as e:
             logger.warning(f"Error detecting table areas: {e}")
 
         return table_areas
+
+    def _is_assessment_text_misclassified_as_table(self, table_candidate, page):
+        """Check if a table candidate is actually assessment text that should not be extracted as an image"""
+        try:
+            # Get all text from the table area
+            bbox = table_candidate['bbox']
+            clip_rect = fitz.Rect(bbox[0], bbox[1], bbox[2], bbox[3])
+            table_text = page.get_text(clip=clip_rect)
+
+            if not table_text or len(table_text.strip()) < 20:
+                return False
+
+            text_lower = table_text.lower()
+
+            # Strong indicators that this is assessment text, not a table
+            assessment_patterns = [
+                'first point', 'second point', 'third point', 'fourth point', 'fifth point',
+                'first assessment', 'second assessment', 'third assessment',
+                'point of assessment', 'assessment point', 'evaluation point',
+                'first criterion', 'second criterion', 'third criterion',
+                'first step', 'second step', 'third step',
+                'first stage', 'second stage', 'third stage'
+            ]
+
+            # Count assessment pattern matches
+            assessment_matches = sum(1 for pattern in assessment_patterns if pattern in text_lower)
+
+            if assessment_matches >= 1:  # Even one match is strong indicator
+                logger.debug(f"Assessment text detected in table candidate: {assessment_matches} patterns found")
+                return True
+
+            # Check for numbered list patterns that are common in assessment text
+            lines = table_text.split('\n')
+            numbered_assessment_lines = 0
+
+            for line in lines:
+                line_stripped = line.strip().lower()
+                if line_stripped:
+                    # Look for assessment-style numbered items
+                    if (re.match(r'^\d+[\.\)]\s+.*(?:point|assessment|criterion|step|stage|evaluation)', line_stripped) or
+                        re.match(r'^(?:first|second|third|fourth|fifth).*(?:point|assessment|criterion)', line_stripped)):
+                        numbered_assessment_lines += 1
+
+            # If significant portion of lines are assessment-style, it's likely assessment text
+            if len(lines) > 2 and numbered_assessment_lines / len(lines) > 0.3:
+                logger.debug(f"Assessment-style numbered list detected: {numbered_assessment_lines}/{len(lines)} lines")
+                return True
+
+            # Check for academic/evaluation keywords that suggest this is text content
+            evaluation_keywords = [
+                'evaluation', 'assessment', 'criteria', 'methodology', 'analysis',
+                'conclusion', 'findings', 'results', 'discussion', 'recommendation',
+                'objective', 'goal', 'purpose', 'approach', 'strategy'
+            ]
+
+            evaluation_count = sum(1 for keyword in evaluation_keywords if keyword in text_lower)
+
+            # If many evaluation keywords and looks like structured text, likely assessment content
+            if evaluation_count >= 3 and len(table_text.split()) > 30:
+                logger.debug(f"Academic evaluation text detected: {evaluation_count} keywords found")
+                return True
+
+            # Check if this looks more like paragraph text than tabular data
+            words = table_text.split()
+            if len(words) > 50:  # Substantial text content
+                # Calculate text characteristics
+                avg_word_length = sum(len(word) for word in words) / len(words)
+                sentence_count = table_text.count('.') + table_text.count('!') + table_text.count('?')
+
+                # If it has characteristics of prose text, likely not a table
+                if (avg_word_length > 4 and  # Longer words suggest prose
+                    sentence_count > 2 and   # Multiple sentences suggest prose
+                    len(words) / max(1, sentence_count) > 10):  # Long sentences suggest prose
+                    logger.debug(f"Prose-like text characteristics detected in table candidate")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"Error checking assessment text classification: {e}")
+            return False  # Conservative: assume it's a valid table
 
     def _detect_equation_areas(self, page, detect_math_symbols):
         """Detect equation areas on a page using mathematical symbol analysis"""
@@ -451,24 +536,28 @@ class PDFParser:
         try:
             page_rect = page.rect
 
-            # Method 1: Check for vector drawings (be generous)
+            # Method 1: Check for vector drawings (be more selective to avoid text formatting)
             drawings = page.get_drawings()
-            if len(drawings) >= 2:  # Even just 2 drawings might be a diagram
-                # Create a large area covering most of the page
-                padding = 30
-                bbox = [
-                    padding,
-                    padding,
-                    page_rect.width - padding,
-                    page_rect.height - padding
-                ]
+            if len(drawings) >= 5:  # Require more drawings to avoid text formatting elements
+                # ENHANCED: Check if this is actually visual content, not just formatted text
+                if self._has_substantial_visual_content(page, drawings):
+                    # Create a large area covering most of the page
+                    padding = 30
+                    bbox = [
+                        padding,
+                        padding,
+                        page_rect.width - padding,
+                        page_rect.height - padding
+                    ]
 
-                visual_areas.append({
-                    'bbox': bbox,
-                    'content_type': 'page_with_drawings',
-                    'confidence': 0.8
-                })
-                logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawings, capturing full page area")
+                    visual_areas.append({
+                        'bbox': bbox,
+                        'content_type': 'page_with_drawings',
+                        'confidence': 0.8
+                    })
+                    logger.debug(f"Page {page_num + 1}: Found {len(drawings)} substantial drawings, capturing full page area")
+                else:
+                    logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawings but they appear to be text formatting elements")
 
             # Method 2: Check for raster images
             images = page.get_images(full=True)
@@ -535,6 +624,95 @@ class PDFParser:
 
         return visual_areas
 
+    def _has_substantial_visual_content(self, page, drawings):
+        """Check if drawings represent substantial visual content, not just text formatting"""
+        try:
+            # Get all text from the page
+            page_text = page.get_text()
+
+            # If page is mostly text with common patterns, likely just formatted text
+            if self._is_likely_formatted_text_page(page_text):
+                return False
+
+            # Analyze drawing complexity
+            complex_drawings = 0
+            total_drawing_area = 0
+
+            for drawing in drawings:
+                try:
+                    if hasattr(drawing, 'rect'):
+                        rect = drawing.rect
+                        area = (rect.x1 - rect.x0) * (rect.y1 - rect.y0)
+                        total_drawing_area += area
+
+                        # Consider drawings with substantial area as complex
+                        if area > 1000:  # Minimum area threshold
+                            complex_drawings += 1
+                except:
+                    continue
+
+            # Need multiple complex drawings for substantial visual content
+            if complex_drawings >= 3:
+                return True
+
+            # Check if drawings cover significant portion of page
+            page_area = page.rect.width * page.rect.height
+            drawing_coverage = total_drawing_area / page_area if page_area > 0 else 0
+
+            # If drawings cover substantial area, likely visual content
+            if drawing_coverage > 0.1:  # More than 10% of page
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"Error checking substantial visual content: {e}")
+            return False  # Conservative: assume it's text formatting
+
+    def _is_likely_formatted_text_page(self, page_text):
+        """Check if page appears to be formatted text rather than visual content"""
+        if not page_text or len(page_text.strip()) < 50:
+            return False
+
+        text_lower = page_text.lower()
+
+        # Strong indicators of formatted text content
+        formatted_text_indicators = [
+            # Assessment/evaluation content
+            'assessment', 'evaluation', 'point', 'criteria', 'first', 'second', 'third',
+            'step', 'phase', 'stage', 'level', 'grade', 'score', 'rating',
+            # List/enumeration patterns
+            'following', 'include', 'such as', 'for example', 'namely',
+            # Academic/formal text
+            'according to', 'research', 'study', 'analysis', 'conclusion',
+            'introduction', 'methodology', 'results', 'discussion'
+        ]
+
+        indicator_count = sum(1 for indicator in formatted_text_indicators if indicator in text_lower)
+
+        # If we have multiple text formatting indicators, likely formatted text
+        if indicator_count >= 3:
+            return True
+
+        # Check for numbered/bulleted lists (common in formatted text)
+        lines = page_text.split('\n')
+        numbered_lines = sum(1 for line in lines if re.match(r'^\s*\d+[\.\)]\s+', line.strip()))
+        bulleted_lines = sum(1 for line in lines if re.match(r'^\s*[•\-\*]\s+', line.strip()))
+
+        if len(lines) > 5 and (numbered_lines + bulleted_lines) / len(lines) > 0.3:
+            return True
+
+        # Check for bold/emphasis patterns (common in formatted text)
+        if len(page_text.split()) > 20:
+            # Look for short emphasized phrases (typical of headings/bold text)
+            words = page_text.split()
+            short_phrases = sum(1 for i in range(len(words)-1) if len(words[i]) < 15 and words[i].istitle())
+
+            if short_phrases / len(words) > 0.2:  # Many title-case words
+                return True
+
+        return False
+
     def _area_has_visual_content(self, page, bbox, content_type):
         """Final check to ensure area actually contains visual content, not just text"""
         try:
@@ -581,24 +759,42 @@ class PDFParser:
             return True  # When in doubt, keep it
 
     def _is_mostly_plain_text(self, text):
-        """Check if text is mostly plain paragraphs (not diagrams)"""
+        """Check if text is mostly plain paragraphs (not diagrams) - ENHANCED for better text detection"""
         if not text or len(text) < 50:
             return True
 
-        # Check for TOC/bibliography indicators (more aggressive)
         text_lower = text.lower()
+
+        # ENHANCED: Check for assessment/evaluation content patterns
+        assessment_indicators = [
+            'assessment', 'evaluation', 'point', 'criteria', 'first', 'second', 'third',
+            'step', 'phase', 'stage', 'level', 'grade', 'score', 'rating',
+            'following', 'include', 'such as', 'for example', 'namely'
+        ]
+        assessment_count = sum(1 for indicator in assessment_indicators if indicator in text_lower)
+
+        if assessment_count >= 2:  # Strong indicator of formatted text content
+            return True
+
+        # Check for TOC/bibliography indicators (more aggressive)
         toc_indicators = ['contents', 'chapter', 'bibliography', 'references', 'index', 'page', 'introduction', 'preface']
         toc_count = sum(1 for indicator in toc_indicators if indicator in text_lower)
 
         if toc_count >= 1:  # Even one indicator is enough
             return True
 
-        # Check for repetitive patterns (TOC structure)
+        # ENHANCED: Check for numbered/bulleted lists (common in formatted text)
         lines = text.split('\n')
         if len(lines) > 3:
             # Count lines with numbers (page numbers, chapter numbers)
             numbered_lines = sum(1 for line in lines if re.search(r'\d+', line.strip()))
-            if numbered_lines / len(lines) > 0.4:  # Lower threshold
+            bulleted_lines = sum(1 for line in lines if re.match(r'^\s*[•\-\*]\s+', line.strip()))
+            list_lines = numbered_lines + bulleted_lines
+
+            if list_lines / len(lines) > 0.3:  # 30% of lines are list items
+                return True
+
+            if numbered_lines / len(lines) > 0.4:  # Lower threshold for numbered content
                 return True
 
         # Check for very regular paragraph text (more aggressive)
@@ -609,6 +805,17 @@ class PDFParser:
             if 30 <= avg_sentence_length <= 300:  # Broader range
                 return True
 
+        # ENHANCED: Check for academic/formal text patterns
+        academic_indicators = [
+            'according to', 'research', 'study', 'analysis', 'conclusion',
+            'methodology', 'results', 'discussion', 'however', 'therefore',
+            'furthermore', 'moreover', 'consequently', 'in addition'
+        ]
+        academic_count = sum(1 for indicator in academic_indicators if indicator in text_lower)
+
+        if academic_count >= 2:  # Academic text patterns
+            return True
+
         # Check for common text patterns
         words = text.split()
         if len(words) > 50:
@@ -616,6 +823,12 @@ class PDFParser:
             common_words = ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by']
             common_count = sum(1 for word in words if word.lower() in common_words)
             if common_count / len(words) > 0.15:  # High ratio of common words
+                return True
+
+        # ENHANCED: Check for title case patterns (common in formatted headings)
+        if len(words) > 10:
+            title_case_words = sum(1 for word in words if word.istitle() and len(word) > 2)
+            if title_case_words / len(words) > 0.3:  # Many title case words
                 return True
 
         return False
@@ -1514,34 +1727,187 @@ class StructuredContentExtractor:
             else:
                 logger.debug(f"No images found for page {page_num + 1}")
         
+        # Improve image placement by associating images with nearby text
+        self._associate_images_with_text(structured_content)
+
         return structured_content
+
+    def _associate_images_with_text(self, structured_content):
+        """Associate images with nearby text content for better placement"""
+        logger.info("🔗 Associating images with nearby text content...")
+
+        # Separate images and text content by page
+        pages_content = {}
+        images_by_page = {}
+
+        for item in structured_content:
+            page_num = item.get('page_num', 1)
+
+            if item.get('type') == 'image':
+                if page_num not in images_by_page:
+                    images_by_page[page_num] = []
+                images_by_page[page_num].append(item)
+            else:
+                if page_num not in pages_content:
+                    pages_content[page_num] = []
+                pages_content[page_num].append(item)
+
+        images_associated = 0
+
+        # Process each page
+        for page_num in images_by_page:
+            page_images = images_by_page[page_num]
+            page_text = pages_content.get(page_num, [])
+
+            if not page_text:
+                continue
+
+            # Sort text content by Y position (top to bottom)
+            page_text.sort(key=lambda x: x.get('bbox', [0, 0, 0, 0])[1], reverse=True)
+
+            for image in page_images:
+                best_text_item = self._find_best_text_for_image(image, page_text)
+
+                if best_text_item:
+                    # Add image reference to the text item
+                    if '_associated_images' not in best_text_item:
+                        best_text_item['_associated_images'] = []
+
+                    # Calculate relative position for placement decision
+                    image_y = image.get('position', {}).get('y0', 0)
+                    text_y = best_text_item.get('bbox', [0, 0, 0, 0])[1]
+
+                    placement_info = {
+                        'image_item': image,
+                        'placement': 'after' if image_y < text_y else 'before',
+                        'distance': abs(image_y - text_y)
+                    }
+
+                    best_text_item['_associated_images'].append(placement_info)
+                    images_associated += 1
+
+                    logger.debug(f"Associated image {image.get('filename')} with text on page {page_num}")
+
+        logger.info(f"🔗 Associated {images_associated} images with text content")
+
+    def _find_best_text_for_image(self, image, page_text_items):
+        """Find the best text item to associate with an image"""
+        if not page_text_items:
+            return None
+
+        image_position = image.get('position', {})
+        image_y = image_position.get('y0', 0)
+        image_center_y = (image_position.get('y0', 0) + image_position.get('y1', 0)) / 2
+
+        best_item = None
+        min_distance = float('inf')
+
+        for text_item in page_text_items:
+            # Skip very short text (likely headers/footers)
+            text = text_item.get('text', '')
+            if len(text.strip()) < 20:
+                continue
+
+            text_bbox = text_item.get('bbox', [0, 0, 0, 0])
+            text_y = text_bbox[1]
+            text_center_y = (text_bbox[1] + text_bbox[3]) / 2
+
+            # Calculate distance between image and text centers
+            distance = abs(image_center_y - text_center_y)
+
+            # Prefer text that's close to the image
+            if distance < min_distance and distance < 200:  # Within 200 points
+                min_distance = distance
+                best_item = text_item
+
+        return best_item
     
+    def smart_join_lines(self, previous_text, new_line, page_num=0):
+        """Enhanced line joining that handles hyphenation and natural sentence flow with special handling for first pages"""
+        if not previous_text or not new_line:
+            return (previous_text or "") + " " + (new_line or "")
+
+        # Special handling for first pages (0-2) where premature line endings are more common
+        is_early_page = page_num <= 2
+
+        # Check if previous line ends with a hyphen (word continuation)
+        if previous_text.endswith('-'):
+            # Remove hyphen and join directly (dehyphenation)
+            return previous_text[:-1] + new_line
+
+        # Check if previous line ends with sentence-ending punctuation
+        if previous_text.rstrip().endswith(('.', '!', '?', ':', ';')):
+            # Start new sentence with proper spacing
+            return previous_text + " " + new_line
+
+        # Enhanced logic for early pages
+        if is_early_page:
+            # More aggressive joining for early pages
+            # Check if previous line seems incomplete (doesn't end with punctuation and is reasonably long)
+            prev_stripped = previous_text.rstrip()
+            if (len(prev_stripped) > 20 and
+                not prev_stripped.endswith(('.', '!', '?', ':', ';', ',')) and
+                not prev_stripped.endswith((')', ']', '"', "'")) and
+                new_line and new_line[0].islower()):
+                return previous_text + " " + new_line
+
+            # Check for common continuation patterns in early pages
+            if (prev_stripped.endswith(('και', 'ή', 'αλλά', 'όμως', 'επίσης', 'ωστόσο', 'παρόλα', 'μετά')) or
+                new_line.startswith(('που', 'όπου', 'όταν', 'αν', 'επειδή', 'καθώς', 'ενώ'))):
+                return previous_text + " " + new_line
+
+        # Check if new line starts with a capital letter (likely new sentence)
+        if new_line and new_line[0].isupper():
+            # Check if previous line seems incomplete (no sentence-ending punctuation)
+            # and is not too short (avoid joining headings)
+            if len(previous_text.split()) > 3 and not previous_text.rstrip().endswith(('.', '!', '?', ':', ';')):
+                # Likely continuation of sentence
+                return previous_text + " " + new_line
+            else:
+                # Likely new sentence
+                return previous_text + " " + new_line
+
+        # Check if new line starts with lowercase (likely continuation)
+        if new_line and new_line[0].islower():
+            # Continuation of previous sentence
+            return previous_text + " " + new_line
+
+        # Check for incomplete sentences (no ending punctuation and reasonable length)
+        prev_stripped = previous_text.rstrip()
+        if (len(prev_stripped) > 15 and
+            not prev_stripped.endswith(('.', '!', '?', ':', ';')) and
+            len(new_line.split()) <= 10):  # Short continuation
+            return previous_text + " " + new_line
+
+        # Default: join with space
+        return previous_text + " " + new_line
+
     def _extract_page_content(self, page, page_num, structure_analysis):
         """Extract content from a single page with structure detection"""
         page_content = []
-        
+
         try:
             blocks = page.get_text("dict")["blocks"]
-            
+
             for block_num, block in enumerate(blocks):
                 if "lines" not in block:
                     continue
-                
-                # Extract text from block
+
+                # Extract text from block with improved line joining
                 block_text = ""
                 block_font_sizes = []
                 block_formatting = {}
-                
-                for line in block["lines"]:
+
+                for line_idx, line in enumerate(block["lines"]):
                     line_text = ""
                     for span in line["spans"]:
                         span_text = span.get("text", "")
                         line_text += span_text
-                        
+
                         # Collect formatting information
                         font_size = span.get("size", 12.0)
                         block_font_sizes.append(font_size)
-                        
+
                         if not block_formatting:
                             block_formatting = {
                                 'font': span.get("font", ""),
@@ -1549,8 +1915,12 @@ class StructuredContentExtractor:
                                 'flags': span.get("flags", 0),
                                 'color': span.get("color", 0)
                             }
-                    
-                    block_text += line_text + "\n"
+
+                    # Use smart line joining instead of simple concatenation
+                    if line_idx == 0:
+                        block_text = line_text.strip()
+                    else:
+                        block_text = self.smart_join_lines(block_text, line_text.strip(), page_num)
                 
                 block_text = block_text.strip()
                 if not block_text:
@@ -1805,3 +2175,75 @@ class StructuredContentExtractor:
             return True
 
         return False
+
+    def extract_toc_from_content(self, structured_content):
+        """Extract and enhance TOC by analyzing both automatic TOC and content text"""
+        logger.info("🔍 Enhanced TOC extraction from content analysis...")
+
+        toc_entries = []
+        content_toc_entries = []
+
+        # Look for TOC-like content in the text
+        for i, item in enumerate(structured_content):
+            text = item.get('text', '').strip()
+            if not text:
+                continue
+
+            # Check if this looks like a TOC entry (contains dots and numbers)
+            import re
+            # Pattern for TOC entries like "Chapter 1 .................. 15"
+            toc_pattern = r'^(.+?)\s*\.{3,}\s*(\d+)\s*$'
+            match = re.match(toc_pattern, text)
+
+            if match:
+                title = match.group(1).strip()
+                page_num = int(match.group(2))
+                content_toc_entries.append({
+                    'title': title,
+                    'page': page_num,
+                    'level': 1,  # Default level, can be refined
+                    'source': 'content_analysis'
+                })
+                logger.debug(f"Found TOC entry from content: '{title}' -> page {page_num}")
+
+            # Also check for numbered headings that might be TOC entries
+            numbered_heading_pattern = r'^(\d+\.?\d*\.?\s+)(.+)$'
+            numbered_match = re.match(numbered_heading_pattern, text)
+            if numbered_match and len(text.split()) <= 10:  # Short enough to be a heading
+                number_part = numbered_match.group(1).strip()
+                title_part = numbered_match.group(2).strip()
+
+                # Determine level based on numbering
+                level = number_part.count('.') + 1 if '.' in number_part else 1
+
+                content_toc_entries.append({
+                    'title': f"{number_part} {title_part}",
+                    'page': None,  # Page number not available from content
+                    'level': level,
+                    'source': 'numbered_heading'
+                })
+
+        # Combine with headings found in the document structure
+        for item in structured_content:
+            if item.get('type') in ['h1', 'h2', 'h3']:
+                level = int(item['type'][1:])  # Extract level from h1, h2, h3
+                toc_entries.append({
+                    'title': item.get('text', '').strip(),
+                    'page': item.get('page_num'),
+                    'level': level,
+                    'source': 'structure_analysis'
+                })
+
+        # Merge and deduplicate entries
+        all_entries = content_toc_entries + toc_entries
+        unique_entries = []
+        seen_titles = set()
+
+        for entry in all_entries:
+            title_normalized = entry['title'].lower().strip()
+            if title_normalized not in seen_titles and len(title_normalized) > 3:
+                seen_titles.add(title_normalized)
+                unique_entries.append(entry)
+
+        logger.info(f"Enhanced TOC extraction found {len(unique_entries)} unique entries")
+        return unique_entries

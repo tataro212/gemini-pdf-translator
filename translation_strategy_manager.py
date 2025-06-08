@@ -2,13 +2,36 @@
 Translation Strategy Manager for Ultimate PDF Translator
 
 Implements dynamic translation strategy with importance-based optimization,
-selective translation, and cost-effective model selection.
+selective translation, cost-effective model selection, and intelligent
+content-aware routing for optimal processing tool selection.
+
+Enhanced with:
+- Content-aware routing (Nougat vs Gemini)
+- Page-level analysis integration
+- Cost optimization through intelligent tool selection
+- Dynamic model selection based on content complexity
 """
 
 import logging
 import re
 from enum import Enum
+from typing import Dict, List, Optional, Tuple, Any
 from config_manager import config_manager
+
+# Optional imports for enhanced functionality
+try:
+    from advanced_document_analyzer import PageProfile, ContentType, AdvancedDocumentAnalyzer
+    ADVANCED_ANALYSIS_AVAILABLE = True
+except ImportError:
+    ADVANCED_ANALYSIS_AVAILABLE = False
+    logging.warning("Advanced document analyzer not available - using basic routing")
+
+try:
+    from onnx_image_classifier import ONNXImageClassifier, RelevanceLevel
+    ONNX_CLASSIFIER_AVAILABLE = True
+except ImportError:
+    ONNX_CLASSIFIER_AVAILABLE = False
+    logging.warning("ONNX image classifier not available - using basic image filtering")
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +47,21 @@ class TranslationPriority(Enum):
     COST = "cost"
     BALANCED = "balanced"
     QUALITY = "quality"
+
+class ProcessingTool(Enum):
+    """Available processing tools for content routing"""
+    GEMINI_FLASH = "gemini_flash"
+    GEMINI_PRO = "gemini_pro"
+    NOUGAT = "nougat"
+    ENHANCED_IMAGE_PROCESSING = "enhanced_image_processing"
+    SKIP = "skip"
+
+class RoutingDecision(Enum):
+    """Routing decision types"""
+    COST_OPTIMIZED = "cost_optimized"
+    QUALITY_OPTIMIZED = "quality_optimized"
+    CONTENT_AWARE = "content_aware"
+    HYBRID = "hybrid"
 
 class TranslationStrategyManager:
     """
@@ -219,7 +257,162 @@ class TranslationStrategyManager:
             return ImportanceLevel.LOW
         
         return ImportanceLevel.MEDIUM
-    
+
+    def route_content_intelligently(self, content_item: Dict, page_profile: Optional[Any] = None) -> ProcessingTool:
+        """
+        Intelligently route content to the optimal processing tool based on
+        content analysis, complexity, and cost considerations.
+        """
+        content_type = content_item.get('type', 'paragraph')
+        text = content_item.get('text', '').strip()
+
+        # Handle images with ONNX classification if available
+        if content_type == 'image':
+            return self._route_image_content(content_item)
+
+        # Use page profile for routing if available
+        if page_profile and ADVANCED_ANALYSIS_AVAILABLE:
+            return self._route_with_page_profile(content_item, page_profile)
+
+        # Fallback to content-based routing
+        return self._route_by_content_analysis(content_item)
+
+    def _route_image_content(self, image_item: Dict) -> ProcessingTool:
+        """Route image content using ONNX classification if available"""
+        if not ONNX_CLASSIFIER_AVAILABLE:
+            # Fallback to basic image handling
+            return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+
+        try:
+            import os
+            from onnx_image_classifier import create_image_classifier, RelevanceLevel
+            classifier = create_image_classifier()
+
+            image_path = image_item.get('filepath', '')
+            if not image_path or not os.path.exists(image_path):
+                return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+
+            classification = classifier.classify_image(image_path)
+
+            # Route based on classification
+            if classification.relevance == RelevanceLevel.SKIP:
+                logger.info(f"🚫 Skipping image {image_path}: {classification.reasoning}")
+                return ProcessingTool.SKIP
+            elif classification.relevance == RelevanceLevel.HIGH:
+                logger.info(f"🔥 High-priority image {image_path}: {classification.reasoning}")
+                return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+            else:
+                logger.info(f"📷 Standard image {image_path}: {classification.reasoning}")
+                return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+
+        except Exception as e:
+            logger.warning(f"Image classification failed: {e}")
+            return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+
+    def _route_with_page_profile(self, content_item: Dict, page_profile: Any) -> ProcessingTool:
+        """Route content using advanced page profile analysis"""
+        try:
+            # Extract content type from page profile
+            if hasattr(page_profile, 'content_type'):
+                content_type = page_profile.content_type
+
+                # Route based on content type
+                if hasattr(content_type, 'value'):
+                    content_type_value = content_type.value
+                    if content_type_value in ['math_heavy', 'formula_dense']:
+                        logger.debug(f"📐 Math-heavy content detected - routing to Nougat")
+                        return ProcessingTool.NOUGAT
+                    elif content_type_value in ['table_heavy', 'diagram_heavy']:
+                        logger.debug(f"📊 Complex layout detected - routing to Nougat")
+                        return ProcessingTool.NOUGAT
+                    elif content_type_value == 'image_dominant':
+                        logger.debug(f"🖼️ Image-dominant content - routing to enhanced image processing")
+                        return ProcessingTool.ENHANCED_IMAGE_PROCESSING
+                    elif content_type_value == 'mixed_content':
+                        logger.debug(f"🔀 Mixed content - routing to Gemini Pro")
+                        return ProcessingTool.GEMINI_PRO
+
+            # Check complexity score
+            if hasattr(page_profile, 'complexity_score') and page_profile.complexity_score > 0.7:
+                logger.debug(f"🧠 High complexity content - routing to Nougat")
+                return ProcessingTool.NOUGAT
+            elif hasattr(page_profile, 'complexity_score') and page_profile.complexity_score > 0.4:
+                logger.debug(f"⚖️ Medium complexity content - routing to Gemini Pro")
+                return ProcessingTool.GEMINI_PRO
+
+        except Exception as e:
+            logger.warning(f"Page profile routing failed: {e}")
+
+        # Fallback to content analysis
+        return self._route_by_content_analysis(content_item)
+
+    def _route_by_content_analysis(self, content_item: Dict) -> ProcessingTool:
+        """Route content based on basic content analysis"""
+        content_type = content_item.get('type', 'paragraph')
+        text = content_item.get('text', '').strip()
+
+        # Mathematical content detection
+        if self._contains_mathematical_content(text):
+            logger.debug(f"🔢 Mathematical content detected - routing to Nougat")
+            return ProcessingTool.NOUGAT
+
+        # Complex table detection
+        if self._contains_complex_tables(text):
+            logger.debug(f"📋 Complex table detected - routing to Nougat")
+            return ProcessingTool.NOUGAT
+
+        # High-importance content gets Pro model
+        importance = self.analyze_content_importance(content_item)
+        if importance == ImportanceLevel.HIGH:
+            logger.debug(f"⭐ High importance content - routing to Gemini Pro")
+            return ProcessingTool.GEMINI_PRO
+
+        # Default to cost-effective Flash model
+        logger.debug(f"💰 Standard content - routing to Gemini Flash")
+        return ProcessingTool.GEMINI_FLASH
+
+    def _contains_mathematical_content(self, text: str) -> bool:
+        """Detect mathematical content in text"""
+        if not text:
+            return False
+
+        # Mathematical indicators
+        math_patterns = [
+            r'\$[^$]+\$',  # LaTeX inline math
+            r'\$\$[^$]+\$\$',  # LaTeX display math
+            r'\\begin\{(equation|align|gather)\}',  # LaTeX environments
+            r'[∑∏∫∂∇∆∞±≤≥≠≈∈∉⊂⊃∪∩]',  # Mathematical symbols
+            r'\\(alpha|beta|gamma|delta|epsilon|theta|lambda|mu|pi|sigma|omega)',  # Greek letters
+            r'\\(sin|cos|tan|log|ln|exp|sqrt|frac)',  # Mathematical functions
+        ]
+
+        for pattern in math_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+
+        # Check for mathematical keywords
+        math_keywords = ['theorem', 'lemma', 'proof', 'equation', 'formula', 'derivative', 'integral']
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in math_keywords)
+
+    def _contains_complex_tables(self, text: str) -> bool:
+        """Detect complex table structures in text"""
+        if not text:
+            return False
+
+        # Table indicators
+        table_patterns = [
+            r'\|[^|]*\|[^|]*\|',  # Markdown table format
+            r'\\begin\{(table|tabular)\}',  # LaTeX tables
+            r'(?:\s+\S+){4,}\s*\n(?:\s+\S+){4,}',  # Multiple columns of data
+        ]
+
+        for pattern in table_patterns:
+            if re.search(pattern, text, re.MULTILINE):
+                return True
+
+        return False
+
     def get_translation_strategy(self, content_item, content_type_analysis=None):
         """
         Get complete translation strategy for a content item including
