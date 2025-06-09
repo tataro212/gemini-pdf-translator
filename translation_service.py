@@ -18,6 +18,14 @@ from utils import get_cache_key
 
 logger = logging.getLogger(__name__)
 
+# Import structured document model for Document translation
+try:
+    from structured_document_model import Document, ContentType, Heading, Paragraph, ListItem, Footnote, Caption
+    STRUCTURED_MODEL_AVAILABLE = True
+except ImportError:
+    STRUCTURED_MODEL_AVAILABLE = False
+    logger.warning("Structured document model not available")
+
 # Import markdown translator (with fallback if not available)
 try:
     from markdown_aware_translator import markdown_translator
@@ -403,10 +411,36 @@ class TranslationService:
                 )
             )
 
-            if response and response.text:
+            # Enhanced response validation with detailed error handling
+            if not response:
+                raise Exception("No response received from translation API")
+
+            # Check for safety/content filtering issues
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'finish_reason'):
+                    finish_reason = candidate.finish_reason
+                    if finish_reason == 2:  # SAFETY
+                        raise Exception(f"Content filtered by safety settings. Text: {text[:100]}...")
+                    elif finish_reason == 3:  # RECITATION
+                        raise Exception(f"Content blocked due to recitation. Text: {text[:100]}...")
+                    elif finish_reason == 4:  # OTHER
+                        raise Exception(f"Content blocked for other reasons. Text: {text[:100]}...")
+
+            # Check if response has valid text
+            if hasattr(response, 'text') and response.text:
                 return response.text.strip()
-            else:
-                raise Exception("Empty response from translation API")
+            elif hasattr(response, 'candidates') and response.candidates:
+                # Try to extract text from candidates
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'content') and candidate.content:
+                    if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                        text_parts = [part.text for part in candidate.content.parts if hasattr(part, 'text')]
+                        if text_parts:
+                            return ''.join(text_parts).strip()
+
+            # If we get here, no valid text was found
+            raise Exception(f"Invalid response: The response contains no valid text. Finish reason: {getattr(getattr(response.candidates[0], 'finish_reason', None), 'name', 'unknown') if hasattr(response, 'candidates') and response.candidates else 'no candidates'}")
 
         try:
             translation = await self.error_recovery.execute_with_retry(make_request)
@@ -427,6 +461,191 @@ class TranslationService:
         except Exception as e:
             logger.error(f"Translation failed for text: {text[:100]}... Error: {e}")
             raise
+
+    async def translate_document(self, document, target_language=None, style_guide=""):
+        """
+        Translate a structured Document object.
+        Only translates content blocks that should be translated (headings, paragraphs, etc.)
+        Preserves non-translatable blocks (images, tables, code, etc.) unchanged.
+        """
+        if not STRUCTURED_MODEL_AVAILABLE:
+            raise Exception("Structured document model not available for Document translation")
+
+        if not isinstance(document, Document):
+            raise ValueError(f"Expected Document object, got {type(document)}")
+
+        if target_language is None:
+            target_language = self.translation_settings['target_language']
+
+        logger.info(f"🌐 Translating Document '{document.title}' to {target_language}")
+        logger.info(f"📊 Document has {len(document.content_blocks)} content blocks")
+
+        # Get translatable and non-translatable blocks
+        translatable_blocks = document.get_translatable_blocks()
+        non_translatable_blocks = document.get_non_translatable_blocks()
+
+        logger.info(f"📝 Translating {len(translatable_blocks)} blocks, preserving {len(non_translatable_blocks)} blocks")
+
+        # Translate only the translatable blocks
+        translated_blocks = []
+        for i, block in enumerate(translatable_blocks):
+            try:
+                logger.debug(f"Translating block {i+1}/{len(translatable_blocks)}: {type(block).__name__}")
+
+                # Get content to translate based on block type
+                if isinstance(block, Heading):
+                    content_to_translate = block.content
+                elif isinstance(block, Paragraph):
+                    content_to_translate = block.content
+                elif isinstance(block, ListItem):
+                    content_to_translate = block.content
+                elif isinstance(block, Footnote):
+                    content_to_translate = block.content
+                elif isinstance(block, Caption):
+                    content_to_translate = block.content
+                else:
+                    # Fallback to original_text
+                    content_to_translate = block.original_text
+
+                # Skip empty content
+                if not content_to_translate or not content_to_translate.strip():
+                    logger.debug(f"Skipping empty content block: {type(block).__name__}")
+                    translated_blocks.append(block)
+                    continue
+
+                # Translate the content with improved prompt structure
+                translated_content = await self._translate_content_block(
+                    content_to_translate,
+                    target_language,
+                    style_guide,
+                    type(block).__name__.lower()
+                )
+
+                # Create new block with translated content
+                translated_block = self._create_translated_block(block, translated_content)
+                translated_blocks.append(translated_block)
+
+            except Exception as e:
+                logger.error(f"Failed to translate block {i+1}: {e}")
+                # Keep original block on translation failure
+                translated_blocks.append(block)
+
+        # Create new Document with translated content blocks
+        # Merge translated and non-translatable blocks in original order
+        all_translated_blocks = []
+        translated_iter = iter(translated_blocks)
+
+        for original_block in document.content_blocks:
+            if original_block.block_type in {ContentType.HEADING, ContentType.PARAGRAPH,
+                                           ContentType.LIST_ITEM, ContentType.FOOTNOTE,
+                                           ContentType.CAPTION}:
+                # Use translated version
+                try:
+                    all_translated_blocks.append(next(translated_iter))
+                except StopIteration:
+                    # Fallback to original if we run out of translated blocks
+                    all_translated_blocks.append(original_block)
+            else:
+                # Keep non-translatable block as-is
+                all_translated_blocks.append(original_block)
+
+        # Create translated document
+        translated_document = Document(
+            title=f"{document.title} ({target_language})",
+            content_blocks=all_translated_blocks,
+            source_filepath=document.source_filepath,
+            total_pages=document.total_pages,
+            metadata={
+                **document.metadata,
+                'translated_to': target_language,
+                'translation_method': 'structured_document_model',
+                'original_title': document.title
+            }
+        )
+
+        logger.info(f"✅ Document translation completed: {len(translated_blocks)} blocks translated")
+        return translated_document
+
+    async def _translate_content_block(self, content, target_language, style_guide, block_type):
+        """Translate content with improved prompt structure to prevent leakage"""
+
+        # Create structured prompt with clear delimiters
+        system_prompt = f"You are a professional translator. Translate the user-provided {block_type} to {target_language}."
+        if style_guide:
+            system_prompt += f" Style guide: {style_guide}"
+
+        user_prompt = f"<TEXT_TO_TRANSLATE>\n{content}\n</TEXT_TO_TRANSLATE>"
+
+        # Combine prompts with clear separation
+        full_prompt = f"{system_prompt}\n\n{user_prompt}\n\nProvide only the {target_language} translation, maintaining the original formatting."
+
+        # Use existing translation infrastructure
+        return await self._translate_raw_text(
+            content, target_language, style_guide, "", "", block_type
+        )
+
+    def _create_translated_block(self, original_block, translated_content):
+        """Create a new content block with translated content"""
+        # Create a copy of the original block with translated content
+        if isinstance(original_block, Heading):
+            return Heading(
+                block_type=original_block.block_type,
+                original_text=translated_content,  # Store translation as new original
+                page_num=original_block.page_num,
+                bbox=original_block.bbox,
+                block_num=original_block.block_num,
+                formatting=original_block.formatting,
+                level=original_block.level,
+                content=translated_content
+            )
+        elif isinstance(original_block, Paragraph):
+            return Paragraph(
+                block_type=original_block.block_type,
+                original_text=translated_content,
+                page_num=original_block.page_num,
+                bbox=original_block.bbox,
+                block_num=original_block.block_num,
+                formatting=original_block.formatting,
+                content=translated_content
+            )
+        elif isinstance(original_block, ListItem):
+            return ListItem(
+                block_type=original_block.block_type,
+                original_text=translated_content,
+                page_num=original_block.page_num,
+                bbox=original_block.bbox,
+                block_num=original_block.block_num,
+                formatting=original_block.formatting,
+                content=translated_content,
+                list_type=original_block.list_type,
+                level=original_block.level
+            )
+        elif isinstance(original_block, Footnote):
+            return Footnote(
+                block_type=original_block.block_type,
+                original_text=translated_content,
+                page_num=original_block.page_num,
+                bbox=original_block.bbox,
+                block_num=original_block.block_num,
+                formatting=original_block.formatting,
+                content=translated_content,
+                reference_id=original_block.reference_id,
+                source_block=original_block.source_block
+            )
+        elif isinstance(original_block, Caption):
+            return Caption(
+                block_type=original_block.block_type,
+                original_text=translated_content,
+                page_num=original_block.page_num,
+                bbox=original_block.bbox,
+                block_num=original_block.block_num,
+                formatting=original_block.formatting,
+                content=translated_content,
+                target_type=original_block.target_type
+            )
+        else:
+            # Fallback: return original block (shouldn't happen for translatable blocks)
+            return original_block
 
     def translate_text_sync(self, text, target_language=None, style_guide="",
                           prev_context="", next_context="", item_type="text block"):

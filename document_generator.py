@@ -18,6 +18,17 @@ from utils import sanitize_for_xml, sanitize_filepath
 
 logger = logging.getLogger(__name__)
 
+# Import structured document model
+try:
+    from structured_document_model import (
+        Document as StructuredDocument, ContentType, Heading, Paragraph, ImagePlaceholder,
+        Table, CodeBlock, ListItem, Footnote, Equation, Caption, Metadata
+    )
+    STRUCTURED_MODEL_AVAILABLE = True
+except ImportError:
+    STRUCTURED_MODEL_AVAILABLE = False
+    logger.warning("Structured document model not available")
+
 # Global bookmark counter
 bookmark_id_counter = 0
 
@@ -83,7 +94,445 @@ class WordDocumentGenerator:
             logger.error(f"Error saving Word document: {e}")
             logger.error(f"Attempted path: {output_filepath}")
             return None
-    
+
+    def create_word_document_from_structured_document(self, structured_document, output_filepath,
+                                                    image_folder_path, cover_page_data=None):
+        """
+        Create Word document from a structured Document object.
+        This is the new method that works with the refactored structured document model.
+        """
+        if not STRUCTURED_MODEL_AVAILABLE:
+            raise Exception("Structured document model not available")
+
+        if not isinstance(structured_document, StructuredDocument):
+            raise ValueError(f"Expected StructuredDocument, got {type(structured_document)}")
+
+        global bookmark_id_counter
+        bookmark_id_counter = 0
+
+        # Normalize paths to handle mixed separators
+        output_filepath = os.path.normpath(output_filepath)
+        if image_folder_path:
+            image_folder_path = os.path.normpath(image_folder_path)
+
+        logger.info(f"--- Creating Word Document from Structured Document: {structured_document.title} ---")
+        logger.info(f"📊 Processing {len(structured_document.content_blocks)} content blocks")
+
+        doc = Document()
+
+        # Add document title as first heading
+        if structured_document.title:
+            title_heading = doc.add_heading(sanitize_for_xml(structured_document.title), level=0)
+            title_heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Add cover page if provided
+        if cover_page_data:
+            self._add_cover_page(doc, cover_page_data, image_folder_path)
+            doc.add_page_break()
+
+        # Generate Table of Contents if enabled
+        if self.word_settings['generate_toc']:
+            self._add_table_of_contents_from_document(doc, structured_document)
+            doc.add_page_break()
+
+        # Process content blocks using isinstance for type-specific rendering
+        for block in structured_document.content_blocks:
+            self._add_content_block(doc, block, image_folder_path)
+
+        # Save document
+        try:
+            # Use centralized sanitization from utils
+            sanitized_filepath = sanitize_filepath(output_filepath)
+
+            # Ensure the output directory exists before saving
+            output_dir = os.path.dirname(sanitized_filepath)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir, exist_ok=True)
+                logger.info(f"Created output directory: {output_dir}")
+
+            doc.save(sanitized_filepath)
+            logger.info(f"Word document saved successfully: {sanitized_filepath}")
+            # Return the actual file path used for saving
+            return sanitized_filepath
+        except Exception as e:
+            logger.error(f"Error saving Word document: {e}")
+            logger.error(f"Attempted path: {output_filepath}")
+            return None
+
+    def _add_table_of_contents_from_document(self, doc, structured_document):
+        """Add table of contents from structured document headings"""
+        try:
+            # Add TOC title with enhanced styling and sanitization
+            safe_toc_title = sanitize_for_xml(self.word_settings['toc_title'])
+            toc_title = doc.add_heading(safe_toc_title, level=1)
+            toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            # Add decorative line under title
+            title_paragraph = doc.add_paragraph()
+            title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            title_run = title_paragraph.add_run("─" * 50)
+            title_run.font.color.rgb = RGBColor(128, 128, 128)
+
+            # Extract headings from structured document
+            headings = structured_document.get_blocks_by_type(ContentType.HEADING)
+
+            if not headings:
+                logger.warning("No headings found for table of contents")
+                return
+
+            # Add TOC entries
+            for i, heading_block in enumerate(headings):
+                if isinstance(heading_block, Heading):
+                    self._add_toc_entry_from_heading_block(doc, heading_block, i + 1)
+
+            # Add spacing after TOC
+            doc.add_paragraph()
+
+            logger.info(f"Table of contents added with {len(headings)} entries")
+
+        except Exception as e:
+            logger.warning(f"Could not add table of contents: {e}")
+
+    def _add_toc_entry_from_heading_block(self, doc, heading_block, entry_number):
+        """Add TOC entry from a Heading content block with improved page estimation"""
+        try:
+            text = heading_block.content
+            level = heading_block.level
+            original_page_num = heading_block.page_num
+
+            # Improved page estimation for final document
+            # Account for TOC pages, cover page, etc.
+            estimated_page = self._estimate_final_page_number(original_page_num, entry_number, level)
+
+            # Sanitize text for XML compatibility
+            safe_text = sanitize_for_xml(text)
+
+            # Create TOC paragraph
+            toc_paragraph = doc.add_paragraph()
+            toc_paragraph.style = 'Normal'
+
+            # Set indentation based on level
+            base_indent = 0.2
+            level_indent = (level - 1) * self.word_settings['list_indent_per_level_inches']
+            toc_paragraph.paragraph_format.left_indent = Inches(base_indent + level_indent)
+
+            # Add entry number for main headings
+            if level == 1:
+                number_run = toc_paragraph.add_run(f"{entry_number}. ")
+                number_run.bold = True
+                number_run.font.color.rgb = RGBColor(0, 0, 128)  # Dark blue
+
+            # Add heading text with hyperlink
+            try:
+                bookmark_name = f"heading_{entry_number}_{level}"
+                hyperlink_run = self._add_hyperlink(toc_paragraph, safe_text, bookmark_name)
+                if level == 1:
+                    hyperlink_run.bold = True
+                    hyperlink_run.font.size = Pt(12)
+                elif level == 2:
+                    hyperlink_run.font.size = Pt(11)
+                else:
+                    hyperlink_run.font.size = Pt(10)
+                    hyperlink_run.italic = True
+            except Exception as e:
+                logger.debug(f"Could not create hyperlink for {safe_text}: {e}")
+                # Fallback to regular text
+                text_run = toc_paragraph.add_run(safe_text)
+                if level == 1:
+                    text_run.bold = True
+                    text_run.font.size = Pt(12)
+                elif level == 2:
+                    text_run.font.size = Pt(11)
+                else:
+                    text_run.font.size = Pt(10)
+                    text_run.italic = True
+
+            # Add dots and page number
+            dots_needed = max(3, 60 - len(text) - len(str(estimated_page)))
+            dots_run = toc_paragraph.add_run(" " + "." * dots_needed + " ")
+            dots_run.font.color.rgb = RGBColor(128, 128, 128)
+
+            page_run = toc_paragraph.add_run(str(estimated_page))
+            page_run.bold = True if level == 1 else False
+
+        except Exception as e:
+            logger.warning(f"Could not add TOC entry: {e}")
+
+    def _estimate_final_page_number(self, original_page_num, entry_number, level):
+        """Estimate the final page number in the Word document accounting for TOC and cover pages"""
+        # Base estimation: original page + offset for cover page and TOC
+        toc_pages = 2  # Estimate 2 pages for TOC
+        cover_pages = 1 if self.word_settings.get('add_cover_page', False) else 0
+
+        # Calculate offset
+        page_offset = cover_pages + toc_pages
+
+        # For the first few headings, use a more conservative estimation
+        if entry_number <= 3:
+            estimated_page = page_offset + entry_number
+        else:
+            # Use original page number with offset
+            estimated_page = max(original_page_num + page_offset, page_offset + entry_number)
+
+        return estimated_page
+
+    def _add_content_block(self, doc, block, image_folder_path):
+        """Add a content block to the document using isinstance for type-specific rendering"""
+        try:
+            if isinstance(block, Heading):
+                self._add_heading_block(doc, block)
+            elif isinstance(block, Paragraph):
+                self._add_paragraph_block(doc, block)
+            elif isinstance(block, ImagePlaceholder):
+                self._add_image_placeholder_block(doc, block, image_folder_path)
+            elif isinstance(block, Table):
+                self._add_table_block(doc, block)
+            elif isinstance(block, CodeBlock):
+                self._add_code_block(doc, block)
+            elif isinstance(block, ListItem):
+                self._add_list_item_block(doc, block)
+            elif isinstance(block, Footnote):
+                self._add_footnote_block(doc, block)
+            elif isinstance(block, Equation):
+                self._add_equation_block(doc, block)
+            elif isinstance(block, Caption):
+                self._add_caption_block(doc, block)
+            elif isinstance(block, Metadata):
+                # Skip metadata blocks - they are not rendered in the final document
+                logger.debug(f"Skipping metadata block: {block.metadata_type}")
+            else:
+                # Fallback to paragraph for unknown block types
+                logger.warning(f"Unknown block type: {type(block)}, treating as paragraph")
+                self._add_fallback_paragraph(doc, block)
+
+        except Exception as e:
+            logger.error(f"Error adding content block {type(block)}: {e}")
+            # Add error placeholder
+            error_paragraph = doc.add_paragraph(f"[Error rendering content block: {type(block).__name__}]")
+            error_paragraph.italic = True
+
+    def _add_heading_block(self, doc, heading_block):
+        """Add a Heading content block to the document"""
+        safe_text = sanitize_for_xml(heading_block.content)
+        heading = doc.add_heading(safe_text, level=heading_block.level)
+
+        # Apply styling if enabled
+        if self.word_settings['apply_styles_to_headings']:
+            heading.paragraph_format.space_before = Pt(self.word_settings['heading_space_before_pt'])
+
+            # Add bookmark for TOC navigation
+            global bookmark_id_counter
+            bookmark_name = f"heading_{bookmark_id_counter}"
+            self._add_bookmark_to_paragraph(heading, bookmark_name)
+            bookmark_id_counter += 1
+
+    def _add_paragraph_block(self, doc, paragraph_block):
+        """Add a Paragraph content block to the document"""
+        safe_text = sanitize_for_xml(paragraph_block.content)
+
+        # Handle paragraph placeholders - split by placeholder and add each as separate paragraph
+        if '[PARAGRAPH_BREAK]' in safe_text:
+            paragraphs = safe_text.split('[PARAGRAPH_BREAK]')
+            for para_text in paragraphs:
+                para_text = para_text.strip()
+                if para_text:  # Only add non-empty paragraphs
+                    self._add_single_paragraph(doc, para_text)
+        else:
+            # No placeholders, add as single paragraph
+            self._add_single_paragraph(doc, safe_text)
+
+    def _add_image_placeholder_block(self, doc, image_block, image_folder_path):
+        """Add an ImagePlaceholder content block to the document"""
+        if not image_folder_path or not image_block.image_path:
+            # Add text placeholder if no image path
+            placeholder_text = f"[Image: {os.path.basename(image_block.image_path) if image_block.image_path else 'Unknown'}]"
+            paragraph = doc.add_paragraph(placeholder_text)
+            paragraph.italic = True
+            logger.debug(f"Added text placeholder for missing image: {placeholder_text}")
+            return
+
+        # Try multiple path resolution strategies
+        possible_paths = []
+
+        # Strategy 1: Use absolute path if provided
+        if os.path.isabs(image_block.image_path):
+            possible_paths.append(image_block.image_path)
+
+        # Strategy 2: Join with image folder path
+        if image_folder_path:
+            possible_paths.append(os.path.normpath(os.path.join(image_folder_path, os.path.basename(image_block.image_path))))
+            possible_paths.append(os.path.normpath(os.path.join(image_folder_path, image_block.image_path)))
+
+        # Strategy 3: Try relative to current working directory
+        possible_paths.append(os.path.normpath(image_block.image_path))
+
+        # Strategy 4: Try in images subdirectory
+        if image_folder_path:
+            images_subdir = os.path.join(image_folder_path, "images")
+            if os.path.exists(images_subdir):
+                possible_paths.append(os.path.normpath(os.path.join(images_subdir, os.path.basename(image_block.image_path))))
+
+        # Find the first existing path
+        image_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                image_path = path
+                logger.debug(f"Found image at: {image_path}")
+                break
+
+        if not image_path:
+            logger.error(f"Image file not found in any of these locations: {possible_paths}")
+            # List available files for debugging
+            if image_folder_path and os.path.exists(image_folder_path):
+                available_files = [f for f in os.listdir(image_folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.bmp'))]
+                logger.debug(f"Available image files in {image_folder_path}: {available_files}")
+
+            placeholder_text = f"[Image not found: {os.path.basename(image_block.image_path)}]"
+            paragraph = doc.add_paragraph(placeholder_text)
+            paragraph.italic = True
+            return
+
+        # Add image with proper sizing
+        try:
+            max_width = config_manager.word_output_settings.get('max_image_width_inches', 6.5)
+            max_height = config_manager.word_output_settings.get('max_image_height_inches', 8.0)
+
+            paragraph = doc.add_paragraph()
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+            run = paragraph.add_run()
+
+            # Calculate optimal size
+            if image_block.width and image_block.height:
+                aspect_ratio = image_block.width / image_block.height
+                if aspect_ratio > 1:  # Landscape
+                    width = min(max_width, Inches(max_width))
+                    height = width / aspect_ratio
+                else:  # Portrait
+                    height = min(max_height, Inches(max_height))
+                    width = height * aspect_ratio
+
+                run.add_picture(image_path, width=width, height=height)
+            else:
+                run.add_picture(image_path, width=Inches(max_width))
+
+            # Add caption if available
+            if image_block.caption:
+                caption_paragraph = doc.add_paragraph()
+                caption_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                caption_run = caption_paragraph.add_run(sanitize_for_xml(image_block.caption))
+                caption_run.italic = True
+                caption_run.font.size = Pt(9)
+                caption_run.font.color.rgb = RGBColor(128, 128, 128)
+
+        except Exception as e:
+            logger.error(f"Error adding image {image_path}: {e}")
+            placeholder_text = f"[Error loading image: {os.path.basename(image_block.image_path)}]"
+            paragraph = doc.add_paragraph(placeholder_text)
+            paragraph.italic = True
+
+    def _add_table_block(self, doc, table_block):
+        """Add a Table content block to the document"""
+        # For now, render table as preformatted text
+        # This can be enhanced later to create actual Word tables
+        safe_text = sanitize_for_xml(table_block.markdown_content)
+        paragraph = doc.add_paragraph(safe_text)
+        paragraph.style = 'Normal'
+        # Make it monospace to preserve table formatting
+        for run in paragraph.runs:
+            run.font.name = 'Courier New'
+            run.font.size = Pt(9)
+
+    def _add_code_block(self, doc, code_block):
+        """Add a CodeBlock content block to the document"""
+        safe_text = sanitize_for_xml(code_block.content)
+        paragraph = doc.add_paragraph(safe_text)
+
+        # Apply code formatting
+        for run in paragraph.runs:
+            run.font.name = 'Courier New'
+            run.font.size = Pt(10)
+
+        # Add background color if possible (limited in python-docx)
+        paragraph.paragraph_format.left_indent = Inches(0.5)
+        paragraph.paragraph_format.right_indent = Inches(0.5)
+
+    def _add_list_item_block(self, doc, list_item_block):
+        """Add a ListItem content block to the document"""
+        safe_text = sanitize_for_xml(list_item_block.content)
+
+        # Remove any existing list markers
+        import re
+        clean_text = re.sub(r'^\s*([*\-•◦∙➢➣►]|(\d{1,2}[\.\)])|([a-zA-Z][\.\)])|(\((?:[ivxlcdm]+|[a-zA-Z]|\d{1,2})\)))\s+', '', safe_text)
+
+        paragraph = doc.add_paragraph(clean_text, style='List Bullet')
+
+        # Apply styling based on list level
+        if self.word_settings['apply_styles_to_paragraphs']:
+            indent = list_item_block.level * self.word_settings['list_indent_per_level_inches']
+            paragraph.paragraph_format.left_indent = Inches(indent)
+
+    def _add_footnote_block(self, doc, footnote_block):
+        """Add a Footnote content block to the document"""
+        safe_text = sanitize_for_xml(footnote_block.content)
+
+        # Add footnote as a separate paragraph with special formatting
+        paragraph = doc.add_paragraph()
+
+        # Add footnote reference if available
+        if footnote_block.reference_id:
+            ref_run = paragraph.add_run(f"[{footnote_block.reference_id}] ")
+            ref_run.font.size = Pt(8)
+            ref_run.font.superscript = True
+
+        # Add footnote content
+        content_run = paragraph.add_run(safe_text)
+        content_run.font.size = Pt(9)
+        content_run.italic = True
+
+        # Indent footnote
+        paragraph.paragraph_format.left_indent = Inches(0.5)
+
+    def _add_equation_block(self, doc, equation_block):
+        """Add an Equation content block to the document"""
+        safe_text = sanitize_for_xml(equation_block.content)
+
+        # Center the equation
+        paragraph = doc.add_paragraph(safe_text)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Apply equation formatting
+        for run in paragraph.runs:
+            run.font.name = 'Cambria Math'
+            run.font.size = Pt(12)
+
+        # Add some spacing around equations
+        paragraph.paragraph_format.space_before = Pt(6)
+        paragraph.paragraph_format.space_after = Pt(6)
+
+    def _add_caption_block(self, doc, caption_block):
+        """Add a Caption content block to the document"""
+        safe_text = sanitize_for_xml(caption_block.content)
+
+        paragraph = doc.add_paragraph(safe_text)
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # Apply caption formatting
+        for run in paragraph.runs:
+            run.italic = True
+            run.font.size = Pt(9)
+            run.font.color.rgb = RGBColor(128, 128, 128)
+
+    def _add_fallback_paragraph(self, doc, block):
+        """Add unknown content block as a paragraph"""
+        content = getattr(block, 'content', '') or block.original_text
+        safe_text = sanitize_for_xml(content)
+        paragraph = doc.add_paragraph(safe_text)
+
+        # Mark as unknown content type
+        for run in paragraph.runs:
+            run.font.color.rgb = RGBColor(128, 128, 128)
+
     def _add_cover_page(self, doc, cover_page_data, image_folder_path):
         """Add cover page to document"""
         try:

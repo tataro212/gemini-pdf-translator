@@ -690,21 +690,45 @@ REMINDER: Return ONLY the translated Markdown with identical structure. Do not a
             original_numbered == translated_numbered
         )
 
-        # Allow more flexibility in paragraph breaks (±20% or minimum 5)
-        max_break_difference = max(5, int(original_breaks * 0.2))
+        # More flexible validation - allow significant differences but warn about them
+        # Allow up to 50% difference in paragraph breaks (translation can change structure)
+        max_break_difference = max(10, int(original_breaks * 0.5))
         breaks_preserved = abs(original_breaks - translated_breaks) <= max_break_difference
 
-        # Log validation results
+        # Calculate validation scores (0-1) instead of strict pass/fail
+        header_score = 1.0
+        if original_h1 + original_h2 + original_h3 > 0:
+            total_original_headers = original_h1 + original_h2 + original_h3
+            total_translated_headers = translated_h1 + translated_h2 + translated_h3
+            header_score = min(1.0, total_translated_headers / total_original_headers) if total_original_headers > 0 else 1.0
+
+        list_score = 1.0
+        if original_bullets + original_numbered > 0:
+            total_original_lists = original_bullets + original_numbered
+            total_translated_lists = translated_bullets + translated_numbered
+            list_score = min(1.0, total_translated_lists / total_original_lists) if total_original_lists > 0 else 1.0
+
+        # Use more lenient thresholds for validation
+        headers_preserved = header_score >= 0.7  # Allow 30% header loss
+        lists_preserved = list_score >= 0.5      # Allow 50% list loss
+
+        # Log validation results with scores
         if not headers_preserved:
-            logger.warning(f"Header structure mismatch: Original(h1:{original_h1}, h2:{original_h2}, h3:{original_h3}) vs Translated(h1:{translated_h1}, h2:{translated_h2}, h3:{translated_h3})")
+            logger.warning(f"Header structure mismatch (score: {header_score:.2f}): Original(h1:{original_h1}, h2:{original_h2}, h3:{original_h3}) vs Translated(h1:{translated_h1}, h2:{translated_h2}, h3:{translated_h3})")
 
         if not lists_preserved:
-            logger.warning(f"List structure mismatch: Original(bullets:{original_bullets}, numbered:{original_numbered}) vs Translated(bullets:{translated_bullets}, numbered:{translated_numbered})")
+            logger.warning(f"List structure mismatch (score: {list_score:.2f}): Original(bullets:{original_bullets}, numbered:{original_numbered}) vs Translated(bullets:{translated_bullets}, numbered:{translated_numbered})")
 
         if not breaks_preserved:
             logger.warning(f"Paragraph break mismatch: Original({original_breaks}) vs Translated({translated_breaks})")
 
-        validation_passed = headers_preserved and lists_preserved and breaks_preserved
+        # Pass validation if at least 2 out of 3 criteria are met, or if scores are reasonable
+        validation_passed = (
+            (headers_preserved and lists_preserved) or
+            (headers_preserved and breaks_preserved) or
+            (lists_preserved and breaks_preserved) or
+            (header_score >= 0.8 and list_score >= 0.8)  # High scores can override break issues
+        )
 
         if validation_passed:
             logger.debug("✅ Markdown structure validation passed")

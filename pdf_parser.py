@@ -12,6 +12,11 @@ import math
 from collections import defaultdict
 from config_manager import config_manager
 from utils import LIST_MARKER_REGEX, CHAPTER_TITLE_PATTERNS
+from structured_document_model import (
+    Document, ContentBlock, ContentType, Heading, Paragraph, ImagePlaceholder,
+    Table, CodeBlock, ListItem, Footnote, Equation, Caption, Metadata,
+    convert_legacy_structured_content_to_document, create_content_block_from_legacy
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1623,28 +1628,41 @@ class StructuredContentExtractor:
         self.parser = PDFParser()
         
     def extract_structured_content_from_pdf(self, filepath, all_extracted_image_refs):
-        """Main function to extract structured content from PDF"""
+        """Main function to extract structured content from PDF - returns Document object"""
         logger.info(f"--- Structuring Content from PDF: {os.path.basename(filepath)} ---")
-        
+
         images_by_page = self.parser.groupby_images_by_page(all_extracted_image_refs)
-        
+
         try:
             doc = fitz.open(filepath)
-            
+
             # Analyze document structure
             structure_analysis = self._analyze_document_structure(doc)
-            
-            # Extract content with structure
-            structured_content = self._extract_content_with_structure(doc, images_by_page, structure_analysis)
-            
+
+            # Extract content with structure as Document object
+            document = self._extract_content_as_document(doc, images_by_page, structure_analysis, filepath)
+
             doc.close()
-            
-            logger.info(f"Extracted {len(structured_content)} structured content items")
-            return structured_content
-            
+
+            logger.info(f"Extracted Document with {len(document.content_blocks)} content blocks across {document.total_pages} pages")
+            return document
+
         except Exception as e:
             logger.error(f"Error extracting structured content: {e}")
-            return []
+            # Return empty document on error
+            return Document(
+                title=f"Error Processing {os.path.basename(filepath)}",
+                source_filepath=filepath,
+                metadata={'error': str(e)}
+            )
+
+    def extract_structured_content_from_pdf_legacy(self, filepath, all_extracted_image_refs):
+        """Legacy method that returns old format for backward compatibility"""
+        document = self.extract_structured_content_from_pdf(filepath, all_extracted_image_refs)
+
+        # Convert Document back to legacy format
+        from structured_document_model import convert_document_to_legacy_format
+        return convert_document_to_legacy_format(document)
     
     def _analyze_document_structure(self, doc):
         """Analyze document structure to identify patterns"""
@@ -1690,7 +1708,388 @@ class StructuredContentExtractor:
                     structure_info['heading_font_sizes'].add(size)
         
         return structure_info
-    
+
+    def _extract_content_as_document(self, doc, images_by_page, structure_analysis, filepath):
+        """Extract content as a structured Document object"""
+        content_blocks = []
+
+        # Extract document title from first page or filename
+        document_title = self._extract_document_title(doc) or os.path.splitext(os.path.basename(filepath))[0]
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+
+            # Extract text blocks with formatting
+            page_content_blocks = self._extract_page_content_as_blocks(page, page_num + 1, structure_analysis)
+            content_blocks.extend(page_content_blocks)
+
+            # Add images for this page as ImagePlaceholder blocks
+            if page_num + 1 in images_by_page:
+                page_images = images_by_page[page_num + 1]
+                logger.debug(f"Adding {len(page_images)} images for page {page_num + 1}")
+
+                for img_ref in page_images:
+                    image_block = ImagePlaceholder(
+                        block_type=ContentType.IMAGE_PLACEHOLDER,
+                        original_text=img_ref.get('ocr_text', ''),
+                        page_num=page_num + 1,
+                        bbox=(img_ref['x0'], img_ref['y0'], img_ref['x1'], img_ref['y1']),
+                        image_path=img_ref['filepath'],
+                        width=img_ref.get('width'),
+                        height=img_ref.get('height'),
+                        ocr_text=img_ref.get('ocr_text'),
+                        translation_needed=img_ref.get('translation_needed', False)
+                    )
+                    content_blocks.append(image_block)
+                    logger.debug(f"Added image block: {img_ref['filename']} at position ({img_ref['x0']}, {img_ref['y0']})")
+            else:
+                logger.debug(f"No images found for page {page_num + 1}")
+
+        # Improve image placement by associating images with nearby text
+        self._associate_images_with_text_blocks(content_blocks)
+
+        # Create and return Document object
+        document = Document(
+            title=document_title,
+            content_blocks=content_blocks,
+            source_filepath=filepath,
+            total_pages=len(doc),
+            metadata={
+                'structure_analysis': structure_analysis,
+                'extraction_method': 'structured_document_model'
+            }
+        )
+
+        return document
+
+    def _extract_document_title(self, doc):
+        """Extract document title from metadata or first page"""
+        try:
+            # Try to get title from PDF metadata
+            metadata = doc.metadata
+            if metadata and metadata.get('title'):
+                return metadata['title'].strip()
+
+            # Try to extract from first page
+            if len(doc) > 0:
+                first_page = doc[0]
+                blocks = first_page.get_text("dict")["blocks"]
+
+                for block in blocks[:3]:  # Check first 3 blocks
+                    if "lines" not in block:
+                        continue
+
+                    block_text = ""
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            block_text += span.get("text", "")
+
+                    block_text = block_text.strip()
+                    if block_text and len(block_text) < 200:  # Reasonable title length
+                        return block_text
+
+        except Exception as e:
+            logger.debug(f"Could not extract document title: {e}")
+
+        return None
+
+    def _extract_page_content_as_blocks(self, page, page_num, structure_analysis):
+        """Extract content from a single page as ContentBlock objects"""
+        content_blocks = []
+
+        try:
+            blocks = page.get_text("dict")["blocks"]
+
+            for block_num, block in enumerate(blocks):
+                if "lines" not in block:
+                    continue
+
+                # Extract text from block with improved line joining
+                block_text = ""
+                block_font_sizes = []
+                block_formatting = {}
+
+                for line_idx, line in enumerate(block["lines"]):
+                    line_text = ""
+                    for span in line["spans"]:
+                        span_text = span.get("text", "")
+                        line_text += span_text
+
+                        # Collect formatting information
+                        font_size = span.get("size", 12.0)
+                        block_font_sizes.append(font_size)
+
+                        if not block_formatting:
+                            block_formatting = {
+                                'font': span.get("font", ""),
+                                'size': font_size,
+                                'flags': span.get("flags", 0),
+                                'color': span.get("color", 0)
+                            }
+
+                    # Use smart line joining instead of simple concatenation
+                    if line_idx == 0:
+                        block_text = line_text.strip()
+                    else:
+                        block_text = self.smart_join_lines(block_text, line_text.strip(), page_num)
+
+                block_text = block_text.strip()
+                if not block_text:
+                    continue
+
+                # Filter out unwanted content (page numbers, headers, footers)
+                if self._should_filter_content(block_text, block.get("bbox", [0, 0, 0, 0]), page_num, structure_analysis):
+                    logger.debug(f"Filtered out content: '{block_text[:50]}...'")
+                    continue
+
+                # Determine content type and create appropriate ContentBlock
+                content_block = self._create_content_block_from_text(
+                    block_text,
+                    block_formatting,
+                    structure_analysis,
+                    page_num,
+                    block_num,
+                    block.get("bbox", [0, 0, 0, 0])
+                )
+
+                if content_block:
+                    content_blocks.append(content_block)
+
+        except Exception as e:
+            logger.warning(f"Error extracting content from page {page_num}: {e}")
+
+        return content_blocks
+
+    def _create_content_block_from_text(self, text, formatting, structure_analysis, page_num, block_num, bbox):
+        """Create appropriate ContentBlock based on text analysis"""
+        import re
+
+        # Ensure bbox is a tuple of 4 floats
+        if isinstance(bbox, list):
+            bbox = tuple(bbox)
+        if len(bbox) != 4:
+            bbox = (0, 0, 0, 0)
+
+        # Classify content type using existing logic
+        content_type = self._classify_content_type(text, formatting, structure_analysis)
+
+        # Detect artifacts and metadata
+        if self._is_processing_artifact(text):
+            return Metadata(
+                block_type=ContentType.METADATA,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                content=text,
+                metadata_type="artifact"
+            )
+
+        # Create specific content block types
+        if content_type in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            level = int(content_type[1])
+            return Heading(
+                block_type=ContentType.HEADING,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                level=level,
+                content=text
+            )
+
+        elif content_type == 'list_item':
+            return ListItem(
+                block_type=ContentType.LIST_ITEM,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                content=text
+            )
+
+        elif content_type == 'table':
+            return Table(
+                block_type=ContentType.TABLE,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                markdown_content=text
+            )
+
+        elif self._is_code_block(text):
+            return CodeBlock(
+                block_type=ContentType.CODE_BLOCK,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                content=text
+            )
+
+        elif self._is_equation(text):
+            return Equation(
+                block_type=ContentType.EQUATION,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                content=text
+            )
+
+        else:  # Default to paragraph
+            return Paragraph(
+                block_type=ContentType.PARAGRAPH,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                formatting=formatting,
+                content=text
+            )
+
+    def _is_processing_artifact(self, text):
+        """Detect processing artifacts like [MISSING_PAGE], etc."""
+        artifact_patterns = [
+            r'\[MISSING_PAGE\]',
+            r'\[PAGE_BREAK\]',
+            r'\[ERROR\]',
+            r'\\begin\{.*?\}',
+            r'\\end\{.*?\}',
+            r'```\s*$',  # Empty code blocks
+        ]
+
+        for pattern in artifact_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+
+    def _is_code_block(self, text):
+        """Detect code blocks"""
+        code_indicators = [
+            r'```',
+            r'^\s*def\s+\w+\(',
+            r'^\s*class\s+\w+',
+            r'^\s*import\s+\w+',
+            r'^\s*from\s+\w+\s+import',
+            r'^\s*function\s+\w+\(',
+            r'^\s*var\s+\w+\s*=',
+            r'^\s*\w+\s*=\s*function\(',
+        ]
+
+        for pattern in code_indicators:
+            if re.search(pattern, text, re.MULTILINE):
+                return True
+        return False
+
+    def _is_equation(self, text):
+        """Detect mathematical equations"""
+        equation_indicators = [
+            r'\$.*?\$',  # LaTeX inline math
+            r'\\\[.*?\\\]',  # LaTeX display math
+            r'\\begin\{equation\}',
+            r'\\begin\{align\}',
+            r'[∑∏∫∂∇±×÷≤≥≠≈∞]',  # Mathematical symbols
+            r'[αβγδεζηθικλμνξοπρστυφχψω]',  # Greek letters
+        ]
+
+        for pattern in equation_indicators:
+            if re.search(pattern, text):
+                return True
+        return False
+
+    def _associate_images_with_text_blocks(self, content_blocks):
+        """Associate images with nearby text content blocks for better placement"""
+        logger.info("🔗 Associating images with nearby text content blocks...")
+
+        # Separate images and text content by page
+        pages_content = {}
+        images_by_page = {}
+
+        for block in content_blocks:
+            page_num = block.page_num
+
+            if isinstance(block, ImagePlaceholder):
+                if page_num not in images_by_page:
+                    images_by_page[page_num] = []
+                images_by_page[page_num].append(block)
+            else:
+                if page_num not in pages_content:
+                    pages_content[page_num] = []
+                pages_content[page_num].append(block)
+
+        images_associated = 0
+
+        # Process each page
+        for page_num in images_by_page:
+            page_images = images_by_page[page_num]
+            page_text = pages_content.get(page_num, [])
+
+            if not page_text:
+                continue
+
+            # Sort text content by Y position (top to bottom)
+            page_text.sort(key=lambda x: x.bbox[1], reverse=True)
+
+            for image in page_images:
+                best_text_block = self._find_best_text_block_for_image(image, page_text)
+
+                if best_text_block:
+                    # Add image reference to the text block
+                    if not hasattr(best_text_block, '_associated_images'):
+                        best_text_block._associated_images = []
+
+                    # Calculate relative position for placement decision
+                    image_y = image.bbox[1]
+                    text_y = best_text_block.bbox[1]
+
+                    placement_info = {
+                        'image_block': image,
+                        'placement': 'after' if image_y < text_y else 'before',
+                        'distance': abs(image_y - text_y)
+                    }
+
+                    best_text_block._associated_images.append(placement_info)
+                    images_associated += 1
+
+                    logger.debug(f"Associated image {image.image_path} with text on page {page_num}")
+
+        logger.info(f"🔗 Associated {images_associated} images with text content blocks")
+
+    def _find_best_text_block_for_image(self, image_block, page_text_blocks):
+        """Find the best text block to associate with an image"""
+        if not page_text_blocks:
+            return None
+
+        image_center_y = (image_block.bbox[1] + image_block.bbox[3]) / 2
+
+        best_block = None
+        min_distance = float('inf')
+
+        for text_block in page_text_blocks:
+            # Skip very short text (likely headers/footers)
+            if len(text_block.original_text.strip()) < 20:
+                continue
+
+            text_center_y = (text_block.bbox[1] + text_block.bbox[3]) / 2
+
+            # Calculate distance between image and text centers
+            distance = abs(image_center_y - text_center_y)
+
+            # Prefer text that's close to the image
+            if distance < min_distance and distance < 200:  # Within 200 points
+                min_distance = distance
+                best_block = text_block
+
+        return best_block
+
     def _extract_content_with_structure(self, doc, images_by_page, structure_analysis):
         """Extract content while preserving document structure"""
         structured_content = []

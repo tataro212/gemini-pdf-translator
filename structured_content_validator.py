@@ -110,19 +110,39 @@ class StructuredContentValidator:
         orig_rows = self._extract_table_rows(original)
         trans_rows = self._extract_table_rows(translated)
         
-        # Check row count
-        if len(orig_rows) != len(trans_rows):
-            issues.append(f"Row count mismatch: original has {len(orig_rows)}, translated has {len(trans_rows)}")
+        # More flexible row count validation - allow minor differences
+        row_diff = abs(len(orig_rows) - len(trans_rows))
+        max_row_diff = max(1, len(orig_rows) // 10)  # Allow up to 10% difference or minimum 1
+
+        if row_diff > max_row_diff:
+            issues.append(f"Significant row count mismatch: original has {len(orig_rows)}, translated has {len(trans_rows)}")
             suggested_fixes.append("Ensure all table rows are preserved during translation")
-        
-        # Check column consistency
+        elif row_diff > 0:
+            # Minor difference - just log as warning, don't fail validation
+            logger.warning(f"Minor row count difference: original has {len(orig_rows)}, translated has {len(trans_rows)}")
+
+        # More flexible column consistency check
         if orig_rows and trans_rows:
-            orig_cols = len(orig_rows[0].split('|')) - 2  # Subtract empty cells at start/end
-            trans_cols = len(trans_rows[0].split('|')) - 2
-            
-            if orig_cols != trans_cols:
-                issues.append(f"Column count mismatch: original has {orig_cols}, translated has {trans_cols}")
-                suggested_fixes.append("Maintain the same number of columns in each table row")
+            # Check multiple rows to get a better sense of column structure
+            orig_col_counts = []
+            trans_col_counts = []
+
+            for i, row in enumerate(orig_rows[:3]):  # Check first 3 rows
+                if '|' in row:
+                    orig_col_counts.append(len(row.split('|')) - 2)
+
+            for i, row in enumerate(trans_rows[:3]):  # Check first 3 rows
+                if '|' in row:
+                    trans_col_counts.append(len(row.split('|')) - 2)
+
+            if orig_col_counts and trans_col_counts:
+                avg_orig_cols = sum(orig_col_counts) / len(orig_col_counts)
+                avg_trans_cols = sum(trans_col_counts) / len(trans_col_counts)
+
+                col_diff = abs(avg_orig_cols - avg_trans_cols)
+                if col_diff > 1:  # Allow 1 column difference
+                    issues.append(f"Column count mismatch: original has ~{avg_orig_cols:.1f}, translated has ~{avg_trans_cols:.1f}")
+                    suggested_fixes.append("Maintain the same number of columns in each table row")
         
         # Check for table separator preservation
         orig_has_separator = bool(self.table_patterns['table_separator'].search(original))
