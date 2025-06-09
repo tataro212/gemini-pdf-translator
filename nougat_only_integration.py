@@ -19,6 +19,9 @@ import fitz  # PyMuPDF for PDF rendering
 
 logger = logging.getLogger(__name__)
 
+# Define the full path to the Nougat executable in the dedicated environment
+NOUGAT_EXECUTABLE_PATH = r"C:\Users\30694\Miniconda3\envs\nougat_env\Scripts\nougat.exe"
+
 class NougatOnlyIntegration:
     """
     NOUGAT-ONLY Integration - No Fallback, Extract Everything
@@ -68,10 +71,19 @@ class NougatOnlyIntegration:
     def _check_nougat_availability(self) -> bool:
         """Check if Nougat is installed and available"""
         try:
-            result = subprocess.run(['nougat', '--help'], 
+            # First try the full path to the dedicated Nougat environment
+            if os.path.exists(NOUGAT_EXECUTABLE_PATH):
+                result = subprocess.run([NOUGAT_EXECUTABLE_PATH, '--help'],
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    logger.info("✅ Nougat is available - NOUGAT-ONLY MODE ready (dedicated environment)")
+                    return True
+
+            # Fallback to system PATH
+            result = subprocess.run(['nougat', '--help'],
                                   capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                logger.info("✅ Nougat is available - NOUGAT-ONLY MODE ready")
+                logger.info("✅ Nougat is available - NOUGAT-ONLY MODE ready (system PATH)")
                 return True
             else:
                 logger.error("❌ Nougat command failed")
@@ -123,9 +135,12 @@ class NougatOnlyIntegration:
         logger.info("🔍 Running comprehensive Nougat analysis...")
         
         try:
+            # Use the full path to the dedicated Nougat environment
+            nougat_exe = NOUGAT_EXECUTABLE_PATH if os.path.exists(NOUGAT_EXECUTABLE_PATH) else 'nougat'
+
             # Enhanced Nougat command for maximum extraction
             cmd = [
-                'nougat', 
+                nougat_exe,
                 pdf_path,
                 '-o', self.temp_dir,
                 '--markdown',

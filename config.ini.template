@@ -16,6 +16,8 @@ source_language = auto
 nougat_only_mode = False
 # Enable Google Drive upload for outputs
 enable_drive_upload = False
+# Enable advanced features (self-correction, hybrid OCR, semantic caching)
+use_advanced_features = True
 
 [Optimization]
 # Smart grouping reduces API calls by combining related content

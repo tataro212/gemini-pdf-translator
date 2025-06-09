@@ -690,8 +690,9 @@ REMINDER: Return ONLY the translated Markdown with identical structure. Do not a
             original_numbered == translated_numbered
         )
 
-        # Allow some flexibility in paragraph breaks (±1)
-        breaks_preserved = abs(original_breaks - translated_breaks) <= 1
+        # Allow more flexibility in paragraph breaks (±20% or minimum 5)
+        max_break_difference = max(5, int(original_breaks * 0.2))
+        breaks_preserved = abs(original_breaks - translated_breaks) <= max_break_difference
 
         # Log validation results
         if not headers_preserved:

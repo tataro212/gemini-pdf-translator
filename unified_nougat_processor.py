@@ -16,6 +16,9 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# Define the full path to the Nougat executable in the dedicated environment
+NOUGAT_EXECUTABLE_PATH = r"C:\Users\30694\Miniconda3\envs\nougat_env\Scripts\nougat.exe"
+
 class NougatMode(Enum):
     """Nougat processing modes"""
     HYBRID = "hybrid"  # Nougat + traditional methods
@@ -75,10 +78,19 @@ class UnifiedNougatProcessor:
     def _check_nougat_availability(self) -> bool:
         """Check if Nougat is installed and available"""
         try:
-            result = subprocess.run(['nougat', '--help'], 
+            # First try the full path to the dedicated Nougat environment
+            if os.path.exists(NOUGAT_EXECUTABLE_PATH):
+                result = subprocess.run([NOUGAT_EXECUTABLE_PATH, '--help'],
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    logger.info("✅ Nougat is available (dedicated environment)")
+                    return True
+
+            # Fallback to system PATH
+            result = subprocess.run(['nougat', '--help'],
                                   capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                logger.info("✅ Nougat is available")
+                logger.info("✅ Nougat is available (system PATH)")
                 return True
             else:
                 logger.error("❌ Nougat command failed")
@@ -125,9 +137,12 @@ class UnifiedNougatProcessor:
     def _run_nougat_command(self, pdf_path: str) -> Optional[str]:
         """Run the core Nougat command and return content"""
         try:
+            # Use the full path to the dedicated Nougat environment
+            nougat_exe = NOUGAT_EXECUTABLE_PATH if os.path.exists(NOUGAT_EXECUTABLE_PATH) else 'nougat'
+
             # Build Nougat command
             cmd = [
-                'nougat', 
+                nougat_exe,
                 pdf_path,
                 '-o', self.temp_dir,
                 '--model', self.config.model_version

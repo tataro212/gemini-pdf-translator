@@ -1,0 +1,13 @@
+{
+  "c5fd6b6b09d72bd06292317c051687c9": {
+    "original_text": "The machine learning model achieved high accuracy.",
+    "translated_text": "Το μοντέλο μηχανικής μάθησης επέτυχε υψηλή ακρίβεια.",
+    "target_language": "Greek",
+    "model_name": "test-model",
+    "timestamp": 1749401848.8916996,
+    "usage_count": 2,
+    "similarity_threshold": 0.8,
+    "context_hash": "d41d8cd9",
+    "quality_score": 1.0
+  }
+}

@@ -9,6 +9,9 @@ import asyncio
 import time
 import logging
 import sys
+import re
+
+logger = logging.getLogger(__name__)
 
 # Import all modular components
 from config_manager import config_manager
@@ -27,7 +30,18 @@ from utils import (
     ProgressTracker
 )
 
-logger = logging.getLogger(__name__)
+# Import advanced features (with fallback if not available)
+try:
+    from advanced_translation_pipeline import AdvancedTranslationPipeline
+    from self_correcting_translator import SelfCorrectingTranslator
+    from hybrid_ocr_processor import HybridOCRProcessor
+    from semantic_cache import SemanticCache
+    ADVANCED_FEATURES_AVAILABLE = True
+    logger.info("✅ Advanced features available: Self-correction, Hybrid OCR, Semantic caching")
+except ImportError as e:
+    ADVANCED_FEATURES_AVAILABLE = False
+    logger.warning(f"⚠️ Advanced features not available: {e}")
+    logger.info("💡 Install advanced features with: pip install -r advanced_features_requirements.txt")
 
 class UltimatePDFTranslator:
     """Main orchestrator class for the PDF translation workflow with enhanced Nougat integration"""
@@ -78,12 +92,182 @@ class UltimatePDFTranslator:
             # Initialize basic integration as fallback
             self.nougat_integration = None
             self.nougat_only_mode = False
+
+        # Initialize advanced features if available
+        self.advanced_pipeline = None
+        self.use_advanced_features = config_manager.get_config_value('General', 'use_advanced_features', True, bool)
+
+        if ADVANCED_FEATURES_AVAILABLE and self.use_advanced_features:
+            try:
+                logger.info("🚀 Initializing advanced translation features...")
+                self.advanced_pipeline = AdvancedTranslationPipeline(
+                    base_translator=translation_service,
+                    nougat_integration=self.nougat_integration,
+                    cache_dir="advanced_semantic_cache",
+                    config_manager=config_manager
+                )
+                logger.info("✅ Advanced features initialized successfully!")
+                logger.info("   🔧 Self-correcting translation enabled")
+                logger.info("   📖 Hybrid OCR strategy enabled")
+                logger.info("   🧠 Semantic caching enabled")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize advanced features: {e}")
+                logger.warning("⚠️ Falling back to standard translation workflow")
+                self.advanced_pipeline = None
+        elif not ADVANCED_FEATURES_AVAILABLE:
+            logger.info("💡 Advanced features not available - using standard workflow")
+        else:
+            logger.info("⚙️ Advanced features disabled in configuration")
         
-    async def translate_document_async(self, filepath, output_dir_for_this_file, 
-                                     target_language_override=None, precomputed_style_guide=None):
-        """Main async translation workflow"""
-        
+    async def translate_document_async(self, filepath, output_dir_for_this_file,
+                                     target_language_override=None, precomputed_style_guide=None,
+                                     use_advanced_features=None):
+        """Main async translation workflow with optional advanced features"""
+
         logger.info(f"🚀 Starting translation of: {os.path.basename(filepath)}")
+        start_time = time.time()
+
+        # Determine if we should use advanced features
+        use_advanced = use_advanced_features if use_advanced_features is not None else self.use_advanced_features
+
+        if self.advanced_pipeline and use_advanced:
+            logger.info("🎯 Using advanced translation pipeline")
+            return await self._translate_document_advanced(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
+        else:
+            logger.info("📝 Using standard translation workflow")
+            return await self._translate_document_standard(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
+
+    async def _translate_document_advanced(self, filepath, output_dir_for_this_file,
+                                         target_language_override=None, precomputed_style_guide=None):
+        """Advanced translation workflow using the enhanced pipeline"""
+
+        logger.info(f"🚀 Starting ADVANCED translation of: {os.path.basename(filepath)}")
+        start_time = time.time()
+
+        try:
+            # Validate inputs
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"Input file not found: {filepath}")
+
+            if not os.path.exists(output_dir_for_this_file):
+                os.makedirs(output_dir_for_this_file, exist_ok=True)
+
+            # Set target language
+            target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
+
+            # Use the advanced pipeline for complete processing
+            logger.info("🔄 Processing with advanced pipeline...")
+            advanced_result = await self.advanced_pipeline.process_document_advanced(
+                pdf_path=filepath,
+                output_dir=output_dir_for_this_file,
+                target_language=target_language
+            )
+
+            # Generate documents from the advanced result
+            base_filename = os.path.splitext(os.path.basename(filepath))[0]
+            output_dir_for_this_file = os.path.normpath(output_dir_for_this_file)
+            word_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx"))
+            pdf_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf"))
+
+            # Convert the advanced result to structured content format
+            logger.debug(f"🔍 Advanced result debug:")
+            logger.debug(f"   • Translated text length: {len(advanced_result.translated_text) if advanced_result.translated_text else 0}")
+            logger.debug(f"   • Translated text preview: {advanced_result.translated_text[:200] if advanced_result.translated_text else 'EMPTY'}")
+
+            structured_content = self._convert_advanced_result_to_content(advanced_result, output_dir_for_this_file)
+
+            logger.debug(f"🔍 Structured content debug:")
+            logger.debug(f"   • Content items created: {len(structured_content)}")
+            if structured_content:
+                type_counts = {}
+                for item in structured_content:
+                    item_type = item.get('type', 'unknown')
+                    type_counts[item_type] = type_counts.get(item_type, 0) + 1
+                logger.debug(f"   • Content breakdown: {type_counts}")
+            else:
+                logger.error("❌ NO STRUCTURED CONTENT CREATED - This will cause document generation to fail!")
+
+            # Generate Word document
+            logger.info("📄 Generating Word document from advanced translation...")
+            logger.debug(f"   • Target path: {word_output_path}")
+            logger.debug(f"   • Image folder: {os.path.join(output_dir_for_this_file, 'images')}")
+            logger.debug(f"   • Content items to process: {len(structured_content)}")
+
+            try:
+                saved_word_filepath = document_generator.create_word_document_with_structure(
+                    structured_content, word_output_path, os.path.join(output_dir_for_this_file, "images"), None
+                )
+
+                logger.debug(f"   • Document generator returned: {saved_word_filepath}")
+
+                if saved_word_filepath and os.path.exists(saved_word_filepath):
+                    file_size = os.path.getsize(saved_word_filepath)
+                    logger.info(f"✅ Word document created successfully: {file_size} bytes")
+                else:
+                    logger.error(f"❌ Document generator returned path but file doesn't exist!")
+                    logger.error(f"   • Returned path: {saved_word_filepath}")
+                    logger.error(f"   • Expected path: {word_output_path}")
+                    logger.error(f"   • File exists check: {os.path.exists(saved_word_filepath) if saved_word_filepath else 'N/A'}")
+                    raise Exception("Word document was not created - file missing after generation")
+
+            except Exception as doc_error:
+                logger.error(f"❌ Document generation failed with error: {doc_error}")
+                logger.error(f"   • Structured content length: {len(structured_content)}")
+                logger.error(f"   • Target directory exists: {os.path.exists(output_dir_for_this_file)}")
+                logger.error(f"   • Target directory writable: {os.access(output_dir_for_this_file, os.W_OK)}")
+                raise Exception(f"Failed to create Word document from advanced translation: {doc_error}")
+
+            if not saved_word_filepath:
+                raise Exception("Failed to create Word document from advanced translation")
+
+            # Convert to PDF
+            logger.info("📑 Converting to PDF...")
+            pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
+
+            # Upload to Google Drive (if configured)
+            drive_results = []
+            if drive_uploader.is_available():
+                logger.info("☁️ Uploading to Google Drive...")
+                files_to_upload = [
+                    {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
+                ]
+
+                if pdf_success and os.path.exists(pdf_output_path):
+                    files_to_upload.append({
+                        'filepath': pdf_output_path,
+                        'filename': f"{base_filename}_translated.pdf"
+                    })
+
+                drive_results = drive_uploader.upload_multiple_files(files_to_upload)
+
+            # Generate enhanced final report
+            end_time = time.time()
+            self._generate_advanced_final_report(
+                filepath, output_dir_for_this_file, start_time, end_time,
+                advanced_result, drive_results, pdf_success
+            )
+
+            # Save caches
+            translation_service.save_caches()
+
+            logger.info("✅ Advanced translation workflow completed successfully!")
+            return precomputed_style_guide
+
+        except Exception as e:
+            logger.error(f"❌ Advanced translation workflow failed: {e}")
+            logger.info("🔄 Falling back to standard translation workflow...")
+            return await self._translate_document_standard(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
+
+    async def _translate_document_standard(self, filepath, output_dir_for_this_file,
+                                         target_language_override=None, precomputed_style_guide=None):
+        """Standard translation workflow (original implementation)"""
+
         start_time = time.time()
         
         try:
@@ -404,7 +588,239 @@ class UltimatePDFTranslator:
                     final_content.append(original_item)
         
         return final_content
-    
+
+    def _convert_advanced_result_to_content(self, advanced_result, output_dir):
+        """Convert advanced translation result to structured content format with heading preservation"""
+        content_items = []
+
+        if advanced_result.translated_text:
+            # Enhanced parsing to preserve heading structure
+            content_items = self._parse_translated_content_with_structure(advanced_result.translated_text)
+
+            # If no structure was detected, fall back to simple paragraph parsing
+            if not content_items:
+                paragraphs = advanced_result.translated_text.split('\n\n')
+                for i, paragraph in enumerate(paragraphs):
+                    if paragraph.strip():
+                        content_items.append({
+                            'type': 'paragraph',
+                            'text': paragraph.strip(),
+                            'page_num': 1,
+                            'block_num': i + 1
+                        })
+
+        return content_items
+
+    def _parse_translated_content_with_structure(self, translated_text):
+        """Parse translated content to preserve heading structure"""
+        content_items = []
+        lines = translated_text.split('\n')
+        current_paragraph = []
+        block_num = 1
+
+        for line in lines:
+            line_stripped = line.strip()
+
+            # Skip empty lines
+            if not line_stripped:
+                # If we have accumulated paragraph content, save it
+                if current_paragraph:
+                    content_items.append({
+                        'type': 'paragraph',
+                        'text': '\n'.join(current_paragraph),
+                        'page_num': 1,
+                        'block_num': block_num
+                    })
+                    current_paragraph = []
+                    block_num += 1
+                continue
+
+            # Check for markdown headings
+            heading_match = re.match(r'^(#{1,6})\s+(.+)$', line_stripped)
+            if heading_match:
+                # Save any accumulated paragraph first
+                if current_paragraph:
+                    content_items.append({
+                        'type': 'paragraph',
+                        'text': '\n'.join(current_paragraph),
+                        'page_num': 1,
+                        'block_num': block_num
+                    })
+                    current_paragraph = []
+                    block_num += 1
+
+                # Add heading
+                level = len(heading_match.group(1))
+                heading_text = heading_match.group(2).strip()
+                content_items.append({
+                    'type': f'h{level}',
+                    'text': heading_text,
+                    'page_num': 1,
+                    'block_num': block_num
+                })
+                block_num += 1
+                continue
+
+            # Check for potential headings (bold text, title-like lines)
+            potential_heading_type = self._detect_potential_heading_type(line_stripped)
+            if potential_heading_type:
+                # Save any accumulated paragraph first
+                if current_paragraph:
+                    content_items.append({
+                        'type': 'paragraph',
+                        'text': '\n'.join(current_paragraph),
+                        'page_num': 1,
+                        'block_num': block_num
+                    })
+                    current_paragraph = []
+                    block_num += 1
+
+                # Add detected heading
+                content_items.append({
+                    'type': potential_heading_type,
+                    'text': self._clean_heading_text(line_stripped),
+                    'page_num': 1,
+                    'block_num': block_num
+                })
+                block_num += 1
+                continue
+
+            # Regular text line - add to current paragraph
+            current_paragraph.append(line_stripped)
+
+        # Don't forget the last paragraph
+        if current_paragraph:
+            content_items.append({
+                'type': 'paragraph',
+                'text': '\n'.join(current_paragraph),
+                'page_num': 1,
+                'block_num': block_num
+            })
+
+        return content_items
+
+    def _detect_potential_heading_type(self, line):
+        """Detect if a line is likely a heading and return its type"""
+        if len(line) > 150:  # Too long to be a heading
+            return None
+
+        # Pattern 1: Bold text that looks like headings
+        bold_pattern = r'^\*\*(.+?)\*\*$'
+        if re.match(bold_pattern, line):
+            heading_text = re.match(bold_pattern, line).group(1).strip()
+            return self._determine_heading_level_from_content(heading_text)
+
+        # Pattern 2: Lines that look like titles (short, capitalized, no period)
+        if (len(line) < 100 and
+            line[0].isupper() and
+            not line.endswith('.') and
+            not line.startswith('*') and
+            ' ' in line):
+
+            words = line.split()
+            if (len(words) >= 3 and
+                sum(1 for word in words if word[0].isupper()) >= len(words) * 0.6):
+                return self._determine_heading_level_from_content(line)
+
+        return None
+
+    def _determine_heading_level_from_content(self, text):
+        """Determine heading level based on content"""
+        text_lower = text.lower()
+
+        # Level 1: Main titles, document titles
+        if any(keyword in text_lower for keyword in ['senda:', 'assessment', 'federation', 'militant']):
+            return 'h1'
+
+        # Level 2: Major sections
+        elif any(keyword in text_lower for keyword in ['need for', 'discourse', 'powerful', 'conclusions', 'συμπεράσματα']):
+            return 'h2'
+
+        # Level 3: Subsections
+        elif any(keyword in text_lower for keyword in ['what should', 'that said', 'implementation']):
+            return 'h3'
+
+        # Default to level 2 for other potential headings
+        else:
+            return 'h2'
+
+    def _clean_heading_text(self, text):
+        """Clean heading text by removing bold markers and extra formatting"""
+        # Remove bold markers
+        text = re.sub(r'^\*\*(.+?)\*\*$', r'\1', text)
+
+        # Clean up whitespace
+        text = ' '.join(text.split())
+
+        return text
+
+    def _generate_advanced_final_report(self, input_filepath, output_dir, start_time, end_time,
+                                      advanced_result, drive_results, pdf_success=True):
+        """Generate comprehensive final report for advanced translation"""
+        duration = end_time - start_time
+
+        # Generate file status
+        word_filename = os.path.basename(input_filepath).replace('.pdf', '_translated.docx')
+        pdf_filename = os.path.basename(input_filepath).replace('.pdf', '_translated.pdf')
+
+        files_section = f"📄 Generated Files:\n• Word Document: {word_filename} ✅"
+
+        if pdf_success:
+            files_section += f"\n• PDF Document: {pdf_filename} ✅"
+        else:
+            files_section += f"\n• PDF Document: {pdf_filename} ❌ (Conversion failed)"
+
+        # Advanced metrics section
+        advanced_metrics = f"""
+🚀 ADVANCED FEATURES PERFORMANCE:
+• OCR Engine Used: {advanced_result.ocr_engine_used}
+• OCR Quality Score: {advanced_result.ocr_quality_score:.2f}
+• Validation Passed: {'✅' if advanced_result.validation_passed else '❌'}
+• Correction Attempts: {advanced_result.correction_attempts}
+• Cache Hit: {'✅' if advanced_result.cache_hit else '❌'} (Semantic: {'✅' if advanced_result.semantic_cache_hit else '❌'})
+• Processing Time: {advanced_result.processing_time:.2f}s
+• Confidence Score: {advanced_result.confidence_score:.2f}
+"""
+
+        report = f"""
+🎉 ADVANCED TRANSLATION COMPLETED {'SUCCESSFULLY' if pdf_success else 'WITH WARNINGS'}!
+=======================================================
+
+📁 Input: {os.path.basename(input_filepath)}
+📁 Output Directory: {output_dir}
+⏱️ Total Time: {duration/60:.1f} minutes
+
+{files_section}
+
+{advanced_metrics}
+"""
+
+        if drive_results:
+            report += f"\n{drive_uploader.get_upload_summary(drive_results)}"
+
+        # Get pipeline optimization recommendations
+        if hasattr(self.advanced_pipeline, 'optimize_pipeline'):
+            try:
+                recommendations = self.advanced_pipeline.optimize_pipeline()
+                if recommendations.get('recommendations'):
+                    report += "\n💡 OPTIMIZATION RECOMMENDATIONS:\n"
+                    for rec in recommendations['recommendations']:
+                        report += f"• {rec}\n"
+            except Exception as e:
+                logger.debug(f"Could not get optimization recommendations: {e}")
+
+        if not pdf_success:
+            report += f"""
+
+⚠️ PDF CONVERSION TROUBLESHOOTING:
+• Ensure Microsoft Word is installed and licensed
+• Check Windows permissions and antivirus settings
+• Try running as administrator
+• Alternative: Use online PDF converters or LibreOffice
+"""
+
+        logger.info(report)
+
     def _generate_final_report(self, input_filepath, output_dir, start_time, end_time,
                              original_items_count, translated_items_count, drive_results, pdf_success=True):
         """Generate comprehensive final report"""
