@@ -10,11 +10,134 @@ import time
 import logging
 import sys
 import re
+import json
+import hashlib
+import shutil
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor
+from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
+# Structured logging setup
+try:
+    import structlog
+    STRUCTURED_LOGGING_AVAILABLE = True
+
+    # Configure structured logging
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.stdlib.add_logger_name,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.PositionalArgumentsFormatter(),
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            structlog.processors.UnicodeDecoder(),
+            structlog.processors.JSONRenderer()
+        ],
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
+        cache_logger_on_first_use=True,
+    )
+
+    # Create structured logger
+    structured_logger = structlog.get_logger()
+    logger.info("✅ Structured logging enabled (JSON output)")
+
+except ImportError:
+    STRUCTURED_LOGGING_AVAILABLE = False
+    structured_logger = None
+    logger.warning("⚠️ Structured logging not available - install with: pip install structlog")
+
+class MetricsCollector:
+    """Collects and logs structured metrics for monitoring"""
+
+    def __init__(self):
+        self.metrics = {}
+        self.start_time = time.time()
+
+    def start_document_processing(self, filepath):
+        """Start tracking metrics for a document"""
+        file_stats = os.stat(filepath)
+        self.metrics = {
+            'document_path': filepath,
+            'document_name': os.path.basename(filepath),
+            'document_hash': hashlib.md5(f"{filepath}:{file_stats.st_size}:{file_stats.st_mtime}".encode()).hexdigest(),
+            'file_size_bytes': file_stats.st_size,
+            'processing_start_time': time.time(),
+            'page_count': 0,
+            'images_found': 0,
+            'headings_found': 0,
+            'paragraphs_found': 0,
+            'tables_found': 0,
+            'processing_pipeline': 'unknown',
+            'errors': [],
+            'warnings': []
+        }
+
+    def update_content_metrics(self, document):
+        """Update metrics based on extracted content"""
+        if not document or not hasattr(document, 'content_blocks'):
+            return
+
+        from structured_document_model import ContentType
+
+        self.metrics['page_count'] = getattr(document, 'total_pages', 0)
+
+        # Count content types
+        for block in document.content_blocks:
+            if hasattr(block, 'block_type'):
+                if block.block_type == ContentType.HEADING:
+                    self.metrics['headings_found'] += 1
+                elif block.block_type == ContentType.PARAGRAPH:
+                    self.metrics['paragraphs_found'] += 1
+                elif block.block_type == ContentType.IMAGE_PLACEHOLDER:
+                    self.metrics['images_found'] += 1
+                elif block.block_type == ContentType.TABLE:
+                    self.metrics['tables_found'] += 1
+
+    def update_translation_metrics(self, translation_time_ms, word_count=0):
+        """Update translation-specific metrics"""
+        self.metrics.update({
+            'time_to_translate_ms': translation_time_ms,
+            'words_translated': word_count,
+            'translation_speed_wpm': (word_count / (translation_time_ms / 60000)) if translation_time_ms > 0 else 0
+        })
+
+    def add_error(self, error_msg):
+        """Add an error to the metrics"""
+        self.metrics['errors'].append(str(error_msg))
+
+    def add_warning(self, warning_msg):
+        """Add a warning to the metrics"""
+        self.metrics['warnings'].append(str(warning_msg))
+
+    def finalize_and_log(self, success=True):
+        """Finalize metrics and log them"""
+        end_time = time.time()
+        self.metrics.update({
+            'processing_end_time': end_time,
+            'total_processing_time_ms': (end_time - self.metrics.get('processing_start_time', end_time)) * 1000,
+            'success': success,
+            'error_count': len(self.metrics.get('errors', [])),
+            'warning_count': len(self.metrics.get('warnings', []))
+        })
+
+        # Log structured metrics
+        if STRUCTURED_LOGGING_AVAILABLE and structured_logger:
+            structured_logger.info("document_processing_completed", **self.metrics)
+        else:
+            # Fallback to JSON logging
+            logger.info(f"METRICS: {json.dumps(self.metrics, indent=2)}")
+
+        return self.metrics
+
 # Import all modular components
 from config_manager import config_manager
+UNIFIED_CONFIG_AVAILABLE = False
 from pdf_parser import PDFParser, StructuredContentExtractor
 from ocr_processor import SmartImageAnalyzer
 from translation_service import translation_service
@@ -63,6 +186,181 @@ except ImportError as e:
     logger.warning(f"⚠️ Intelligent pipeline not available: {e}")
     logger.info("💡 Intelligent pipeline requires additional dependencies")
 
+# Import YOLO integration pipeline (with fallback if not available)
+try:
+    from yolov8_integration_pipeline import YOLOv8IntegrationPipeline
+    YOLO_PIPELINE_AVAILABLE = True
+    logger.info("🎯 YOLOv8 pipeline available: Supreme visual detection accuracy")
+except ImportError as e:
+    YOLO_PIPELINE_AVAILABLE = False
+    logger.warning(f"⚠️ YOLOv8 pipeline not available: {e}")
+    logger.info("💡 YOLOv8 pipeline requires ultralytics and additional dependencies")
+
+# Import distributed tracing for comprehensive pipeline monitoring
+try:
+    from distributed_tracing import tracer, SpanType, start_trace, span, add_metadata, finish_trace
+    DISTRIBUTED_TRACING_AVAILABLE = True
+    logger.info("🔍 Distributed tracing available: Pipeline monitoring enabled")
+except ImportError as e:
+    DISTRIBUTED_TRACING_AVAILABLE = False
+    logger.warning(f"⚠️ Distributed tracing not available: {e}")
+    # Create dummy functions for compatibility
+    def start_trace(*args, **kwargs): return "dummy_trace"
+    def span(*args, **kwargs):
+        from contextlib import nullcontext
+        return nullcontext()
+    def add_metadata(**kwargs): pass
+    def finish_trace(*args, **kwargs): pass
+
+def _process_single_page(task):
+    """
+    Process a single page in a separate process.
+    This function must be at module level to be pickable by ProcessPoolExecutor.
+    """
+    try:
+        import fitz
+        from pdf_parser import StructuredContentExtractor
+
+        filepath = task['filepath']
+        page_num = task['page_num']
+        page_images = task['page_images']
+
+        # Create a new extractor instance for this process
+        extractor = StructuredContentExtractor()
+
+        # Open document and extract single page
+        doc = fitz.open(filepath)
+        page = doc[page_num]
+
+        # Analyze document structure (needed for content classification)
+        structure_analysis = extractor._analyze_document_structure(doc)
+
+        # Extract content from this page only
+        page_content_blocks = extractor._extract_page_content_as_blocks(
+            page, page_num + 1, structure_analysis
+        )
+
+        # Add images for this page
+        for img_ref in page_images:
+            from structured_document_model import ImagePlaceholder, ContentType
+            image_block = ImagePlaceholder(
+                block_type=ContentType.IMAGE_PLACEHOLDER,
+                original_text=img_ref.get('ocr_text', ''),
+                page_num=page_num + 1,
+                bbox=(img_ref['x0'], img_ref['y0'], img_ref['x1'], img_ref['y1']),
+                image_path=img_ref['filepath'],
+                width=img_ref.get('width'),
+                height=img_ref.get('height'),
+                ocr_text=img_ref.get('ocr_text'),
+                translation_needed=img_ref.get('translation_needed', False)
+            )
+            page_content_blocks.append(image_block)
+
+        doc.close()
+
+        # Return page data
+        return {
+            'page_num': page_num,
+            'content_blocks': page_content_blocks,
+            'title': extractor._extract_document_title(doc) if page_num == 0 else None
+        }
+
+    except Exception as e:
+        # Return the exception to be handled by the main process
+        return e
+
+class FailureTracker:
+    """Tracks PDF processing failures and manages quarantine system"""
+
+    def __init__(self, quarantine_dir="quarantine", max_retries=3):
+        self.quarantine_dir = Path(quarantine_dir)
+        self.quarantine_dir.mkdir(exist_ok=True)
+        self.max_retries = max_retries
+        self.failure_counts = defaultdict(int)
+        self.failure_log_path = self.quarantine_dir / "failure_log.json"
+        self._load_failure_log()
+
+    def _load_failure_log(self):
+        """Load existing failure counts from disk"""
+        if self.failure_log_path.exists():
+            try:
+                with open(self.failure_log_path, 'r') as f:
+                    self.failure_counts = defaultdict(int, json.load(f))
+            except Exception as e:
+                logger.warning(f"Could not load failure log: {e}")
+
+    def _save_failure_log(self):
+        """Save failure counts to disk"""
+        try:
+            with open(self.failure_log_path, 'w') as f:
+                json.dump(dict(self.failure_counts), f, indent=2)
+        except Exception as e:
+            logger.error(f"Could not save failure log: {e}")
+
+    def get_file_hash(self, filepath):
+        """Generate a unique hash for a file based on its path and size"""
+        try:
+            stat = os.stat(filepath)
+            content = f"{filepath}:{stat.st_size}:{stat.st_mtime}"
+            return hashlib.md5(content.encode()).hexdigest()
+        except Exception:
+            return hashlib.md5(filepath.encode()).hexdigest()
+
+    def should_process_file(self, filepath):
+        """Check if file should be processed or is quarantined"""
+        file_hash = self.get_file_hash(filepath)
+        return self.failure_counts[file_hash] < self.max_retries
+
+    def record_failure(self, filepath, error):
+        """Record a failure and quarantine if max retries exceeded"""
+        file_hash = self.get_file_hash(filepath)
+        self.failure_counts[file_hash] += 1
+
+        if self.failure_counts[file_hash] >= self.max_retries:
+            self._quarantine_file(filepath, error)
+            return True  # File was quarantined
+
+        self._save_failure_log()
+        return False  # File not quarantined yet
+
+    def _quarantine_file(self, filepath, error):
+        """Move problematic file to quarantine directory"""
+        try:
+            filename = os.path.basename(filepath)
+            quarantine_path = self.quarantine_dir / filename
+
+            # Avoid name conflicts
+            counter = 1
+            while quarantine_path.exists():
+                name, ext = os.path.splitext(filename)
+                quarantine_path = self.quarantine_dir / f"{name}_{counter}{ext}"
+                counter += 1
+
+            shutil.copy2(filepath, quarantine_path)
+
+            # Create error report
+            error_report = {
+                "original_path": str(filepath),
+                "quarantine_path": str(quarantine_path),
+                "failure_count": self.failure_counts[self.get_file_hash(filepath)],
+                "last_error": str(error),
+                "quarantined_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            report_path = quarantine_path.with_suffix('.error.json')
+            with open(report_path, 'w') as f:
+                json.dump(error_report, f, indent=2)
+
+            logger.critical(f"🚨 QUARANTINED: {filename} after {self.max_retries} failures")
+            logger.critical(f"   📁 Moved to: {quarantine_path}")
+            logger.critical(f"   📋 Error report: {report_path}")
+            logger.critical(f"   ❌ Last error: {error}")
+
+            self._save_failure_log()
+
+        except Exception as quarantine_error:
+            logger.error(f"Failed to quarantine {filepath}: {quarantine_error}")
+
 class UltimatePDFTranslator:
     """Main orchestrator class for the PDF translation workflow with enhanced Nougat integration"""
 
@@ -74,7 +372,10 @@ class UltimatePDFTranslator:
         self.quality_report_messages = []
 
         # Check for NOUGAT-ONLY mode preference
-        nougat_only_mode = config_manager.get_config_value('General', 'nougat_only_mode', False, bool)
+        if UNIFIED_CONFIG_AVAILABLE:
+            nougat_only_mode = config_manager.get_value('general', 'nougat_only_mode', False)
+        else:
+            nougat_only_mode = config_manager.get_config_value('General', 'nougat_only_mode', False, bool)
 
         try:
             if nougat_only_mode:
@@ -115,7 +416,10 @@ class UltimatePDFTranslator:
 
         # Initialize advanced features if available
         self.advanced_pipeline = None
-        self.use_advanced_features = config_manager.get_config_value('General', 'use_advanced_features', True, bool)
+        if UNIFIED_CONFIG_AVAILABLE:
+            self.use_advanced_features = config_manager.get_value('general', 'use_advanced_features', True)
+        else:
+            self.use_advanced_features = config_manager.get_config_value('General', 'use_advanced_features', True, bool)
 
         if ADVANCED_FEATURES_AVAILABLE and self.use_advanced_features:
             try:
@@ -141,13 +445,26 @@ class UltimatePDFTranslator:
 
         # Initialize intelligent pipeline if available
         self.intelligent_pipeline = None
-        self.use_intelligent_pipeline = config_manager.get_config_value('IntelligentPipeline', 'use_intelligent_pipeline', True, bool)
+        try:
+            if UNIFIED_CONFIG_AVAILABLE:
+                self.use_intelligent_pipeline = config_manager.get_value('intelligent_pipeline', 'use_intelligent_pipeline', True)
+            else:
+                self.use_intelligent_pipeline = config_manager.get_config_value('IntelligentPipeline', 'use_intelligent_pipeline', True, bool)
+        except Exception as e:
+            logger.warning(f"Could not get intelligent pipeline config: {e}, defaulting to True")
+            self.use_intelligent_pipeline = True
 
         if INTELLIGENT_PIPELINE_AVAILABLE and self.use_intelligent_pipeline:
             try:
                 logger.info("🧠 Initializing intelligent processing pipeline...")
                 # Use the correct initialization - IntelligentPDFTranslator only takes max_workers parameter
-                max_workers = config_manager.get_config_value('IntelligentPipeline', 'max_concurrent_tasks', 4, int)
+                try:
+                    if UNIFIED_CONFIG_AVAILABLE:
+                        max_workers = config_manager.get_value('intelligent_pipeline', 'max_concurrent_tasks', 4)
+                    else:
+                        max_workers = config_manager.get_config_value('IntelligentPipeline', 'max_concurrent_tasks', 4, int)
+                except Exception:
+                    max_workers = 4
                 self.intelligent_pipeline = IntelligentPDFTranslator(max_workers=max_workers)
                 logger.info("✅ Intelligent pipeline initialized successfully!")
                 logger.info("   🎯 Content-aware routing enabled")
@@ -165,7 +482,49 @@ class UltimatePDFTranslator:
             logger.info("💡 Intelligent pipeline not available - using advanced/standard workflow")
         else:
             logger.info("⚙️ Intelligent pipeline disabled in configuration")
-        
+
+        # Initialize YOLO pipeline (if available and enabled)
+        self.yolo_pipeline = None
+        self.use_yolo_pipeline = False
+        if YOLO_PIPELINE_AVAILABLE:
+            try:
+                if UNIFIED_CONFIG_AVAILABLE:
+                    yolo_enabled = config_manager.get_value('yolo_integration', 'enable_yolo', False)
+                    yolo_service_url = config_manager.get_value('yolo_integration', 'yolo_service_url', 'http://localhost:8000')
+                else:
+                    yolo_enabled = config_manager.get_config_value('YOLOIntegration', 'enable_yolo', False, bool)
+                    yolo_service_url = config_manager.get_config_value('YOLOIntegration', 'yolo_service_url', 'http://localhost:8000', str)
+
+                if yolo_enabled:
+                    logger.info("🎯 Initializing YOLOv8 integration pipeline...")
+                    self.yolo_pipeline = YOLOv8IntegrationPipeline(yolo_service_url=yolo_service_url)
+                    self.use_yolo_pipeline = True
+                    logger.info("✅ YOLOv8 pipeline initialized successfully!")
+                    logger.info("   🖼️ Supreme visual detection accuracy enabled")
+                    logger.info("   🔍 Advanced layout analysis enabled")
+                    logger.info("   🚫 Image translation bypassed (user requirement)")
+                else:
+                    logger.info("⚠️ YOLOv8 integration disabled in configuration")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize YOLOv8 pipeline: {e}")
+                self.yolo_pipeline = None
+                self.use_yolo_pipeline = False
+        elif not YOLO_PIPELINE_AVAILABLE:
+            logger.info("💡 YOLOv8 pipeline not available - using standard visual detection")
+
+        # Initialize parallel processing settings
+        if UNIFIED_CONFIG_AVAILABLE:
+            self.max_workers = config_manager.get_value('performance', 'max_parallel_workers', 4)
+            self.enable_parallel_processing = config_manager.get_value('performance', 'enable_parallel_processing', True)
+            self.enable_metrics = config_manager.get_value('monitoring', 'enable_structured_metrics', True)
+        else:
+            self.max_workers = config_manager.get_config_value('Performance', 'max_parallel_workers', 4, int)
+            self.enable_parallel_processing = config_manager.get_config_value('Performance', 'enable_parallel_processing', True, bool)
+            self.enable_metrics = config_manager.get_config_value('Monitoring', 'enable_structured_metrics', True, bool)
+
+        logger.info(f"⚡ Parallel processing: {'enabled' if self.enable_parallel_processing else 'disabled'} (max workers: {self.max_workers})")
+        logger.info(f"📊 Structured metrics: {'enabled' if self.enable_metrics else 'disabled'}")
+
     async def translate_document_async(self, filepath, output_dir_for_this_file,
                                      target_language_override=None, precomputed_style_guide=None,
                                      use_advanced_features=None):
@@ -177,22 +536,28 @@ class UltimatePDFTranslator:
         # Determine processing pipeline priority
         use_advanced = use_advanced_features if use_advanced_features is not None else self.use_advanced_features
 
-        # Priority 1: Intelligent Pipeline (if available and enabled)
-        if self.intelligent_pipeline and self.use_intelligent_pipeline:
-            logger.info("🧠 Using intelligent processing pipeline")
-            return await self._translate_document_intelligent(
-                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
-            )
-        # Priority 2: Advanced Pipeline (if available and enabled)
-        elif self.advanced_pipeline and use_advanced:
-            logger.info("🎯 Using advanced translation pipeline")
+        # Priority 1: Advanced Pipeline (NOW WITH PARALLEL PROCESSING!)
+        if self.advanced_pipeline and use_advanced:
+            logger.info("🎯 Using advanced translation pipeline (PARALLEL PROCESSING ENABLED)")
             return await self._translate_document_advanced(
                 filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
             )
-        # Priority 3: Structured Document Model (if available)
+        # Priority 2: YOLOv8 Pipeline (if available and enabled) - Supreme accuracy
+        elif self.yolo_pipeline and self.use_yolo_pipeline:
+            logger.info("🎯 Using YOLOv8 supreme accuracy pipeline")
+            return await self._translate_document_yolo(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
+        # Priority 3: Structured Document Model (also has parallel processing)
         elif STRUCTURED_MODEL_AVAILABLE:
-            logger.info("🏗️ Using structured document model workflow")
+            logger.info("🏗️ Using structured document model workflow (PARALLEL PROCESSING)")
             return await self._translate_document_structured(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
+        # Priority 4: Intelligent Pipeline (if available and enabled)
+        elif self.intelligent_pipeline and self.use_intelligent_pipeline:
+            logger.info("🧠 Using intelligent processing pipeline")
+            return await self._translate_document_intelligent(
                 filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
             )
         # Fallback: Standard workflow
@@ -201,6 +566,156 @@ class UltimatePDFTranslator:
             return await self._translate_document_standard(
                 filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
             )
+
+    async def _extract_pages_in_parallel(self, filepath, extracted_images):
+        """Extract pages in parallel using ProcessPoolExecutor"""
+        if not self.enable_parallel_processing:
+            # Fall back to sequential processing
+            return self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+
+        logger.info(f"⚡ Starting parallel page extraction with {self.max_workers} workers...")
+        start_time = time.time()
+
+        try:
+            import fitz
+            doc = fitz.open(filepath)
+            total_pages = len(doc)
+            doc.close()
+
+            if total_pages <= 2:
+                # For small documents, parallel processing overhead isn't worth it
+                logger.info(f"📄 Document has only {total_pages} pages, using sequential processing")
+                return self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+
+            # Group images by page
+            images_by_page = self.pdf_parser.groupby_images_by_page(extracted_images)
+
+            # Create page processing tasks
+            page_tasks = []
+            for page_num in range(total_pages):
+                page_images = images_by_page.get(page_num + 1, [])
+                page_tasks.append({
+                    'filepath': filepath,
+                    'page_num': page_num,
+                    'page_images': page_images
+                })
+
+            # Process pages in parallel
+            loop = asyncio.get_event_loop()
+            with ProcessPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all page processing tasks
+                futures = [
+                    loop.run_in_executor(executor, _process_single_page, task)
+                    for task in page_tasks
+                ]
+
+                # Wait for all pages to complete
+                page_results = await asyncio.gather(*futures, return_exceptions=True)
+
+            # Combine results and handle any errors
+            successful_pages = []
+            failed_pages = []
+
+            for i, result in enumerate(page_results):
+                if isinstance(result, Exception):
+                    failed_pages.append((i, result))
+                    logger.warning(f"⚠️ Page {i+1} processing failed: {result}")
+                else:
+                    successful_pages.append((i, result))
+
+            if failed_pages:
+                logger.warning(f"⚠️ {len(failed_pages)} pages failed parallel processing, falling back to sequential")
+                return self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+
+            # Assemble pages in correct order
+            all_content_blocks = []
+            document_title = None
+
+            for page_num, page_content in sorted(successful_pages):
+                if page_content and 'content_blocks' in page_content:
+                    all_content_blocks.extend(page_content['content_blocks'])
+                    if not document_title and page_content.get('title'):
+                        document_title = page_content['title']
+
+            # Create final document
+            from structured_document_model import Document
+            document = Document(
+                title=document_title or os.path.splitext(os.path.basename(filepath))[0],
+                content_blocks=all_content_blocks,
+                source_filepath=filepath,
+                total_pages=total_pages,
+                metadata={
+                    'extraction_method': 'parallel_processing',
+                    'workers_used': self.max_workers,
+                    'processing_time_seconds': time.time() - start_time
+                }
+            )
+
+            end_time = time.time()
+            speedup = total_pages / (end_time - start_time) if (end_time - start_time) > 0 else 0
+            logger.info(f"⚡ Parallel extraction completed in {end_time - start_time:.2f}s")
+            logger.info(f"📊 Processing speed: {speedup:.1f} pages/second")
+            logger.info(f"🏗️ Assembled document with {len(all_content_blocks)} content blocks")
+
+            return document
+
+        except Exception as e:
+            logger.warning(f"⚠️ Parallel processing failed: {e}, falling back to sequential")
+            return self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+
+    async def _translate_document_yolo(self, filepath, output_dir_for_this_file,
+                                     target_language_override=None, precomputed_style_guide=None):
+        """YOLOv8 supreme accuracy translation workflow"""
+
+        logger.info(f"🎯 Starting YOLOv8 SUPREME ACCURACY translation of: {os.path.basename(filepath)}")
+        start_time = time.time()
+
+        try:
+            # Validate inputs
+            if not os.path.exists(filepath):
+                raise FileNotFoundError(f"Input file not found: {filepath}")
+
+            if not os.path.exists(output_dir_for_this_file):
+                os.makedirs(output_dir_for_this_file, exist_ok=True)
+
+            # Set target language
+            target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
+
+            # Process with YOLOv8 supreme accuracy pipeline
+            logger.info("🎯 Processing with YOLOv8 supreme accuracy pipeline...")
+            yolo_result = await self.yolo_pipeline.process_pdf_with_yolo_supreme_accuracy(
+                pdf_path=filepath,
+                output_dir=output_dir_for_this_file,
+                target_language=target_language
+            )
+
+            # Generate final report
+            end_time = time.time()
+            self._generate_yolo_final_report(
+                filepath, output_dir_for_this_file, start_time, end_time, yolo_result
+            )
+
+            # Save caches
+            translation_service.save_caches()
+
+            logger.info("✅ YOLOv8 supreme accuracy translation completed successfully!")
+            return precomputed_style_guide
+
+        except Exception as e:
+            logger.error(f"❌ YOLOv8 translation workflow failed: {e}")
+            logger.info("🔄 Falling back to intelligent translation workflow...")
+            if self.intelligent_pipeline:
+                return await self._translate_document_intelligent(
+                    filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+                )
+            elif self.advanced_pipeline:
+                return await self._translate_document_advanced(
+                    filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+                )
+            else:
+                return await self._translate_document_standard(
+                    filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+                )
 
     async def _translate_document_intelligent(self, filepath, output_dir_for_this_file,
                                             target_language_override=None, precomputed_style_guide=None):
@@ -316,10 +831,19 @@ class UltimatePDFTranslator:
 
     async def _translate_document_advanced(self, filepath, output_dir_for_this_file,
                                          target_language_override=None, precomputed_style_guide=None):
-        """Advanced translation workflow using the enhanced pipeline"""
+        """Advanced translation workflow using the enhanced pipeline with data-flow validation and distributed tracing"""
 
         logger.info(f"🚀 Starting ADVANCED translation of: {os.path.basename(filepath)}")
         start_time = time.time()
+
+        # Initialize metrics collection
+        metrics = MetricsCollector() if self.enable_metrics else None
+        if metrics:
+            metrics.start_document_processing(filepath)
+            metrics.metrics['processing_pipeline'] = 'advanced'
+
+        # Start distributed trace for this document
+        trace_id = start_trace("advanced_translation_workflow", filepath)
 
         try:
             # Validate inputs
@@ -333,39 +857,73 @@ class UltimatePDFTranslator:
             target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
 
             # STEP 1: Extract structured document with images FIRST
-            logger.info("📄 Step 1: Extracting structured document with images...")
+            with span("extract_structured_document", SpanType.CONTENT_EXTRACTION,
+                     document_model="structured", file_size_bytes=os.path.getsize(filepath)):
+                logger.info("📄 Step 1: Extracting structured document with images...")
 
-            # Extract images and create structured document
-            pdf_parser = PDFParser()
-            image_folder = os.path.join(output_dir_for_this_file, "images")
-            os.makedirs(image_folder, exist_ok=True)
+                # Extract images and create structured document
+                pdf_parser = PDFParser()
+                image_folder = os.path.join(output_dir_for_this_file, "images")
+                os.makedirs(image_folder, exist_ok=True)
 
-            # Extract images
-            extracted_images = pdf_parser.extract_images_from_pdf(filepath, image_folder)
-            logger.info(f"🖼️ Extracted {len(extracted_images)} images")
+                # Extract images
+                with span("extract_images", SpanType.IMAGE_EXTRACTION):
+                    extracted_images = pdf_parser.extract_images_from_pdf(filepath, image_folder)
+                    logger.info(f"🖼️ Extracted {len(extracted_images)} images")
+                    add_metadata(images_extracted=len(extracted_images))
 
-            # Create structured document with images
-            content_extractor = StructuredContentExtractor()
-            structured_document = content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
-            logger.info(f"📊 Created structured document with {len(structured_document.content_blocks)} blocks")
+                # Create structured document with images
+                with span("create_structured_document", SpanType.CONTENT_EXTRACTION):
+                    content_extractor = StructuredContentExtractor()
+                    structured_document = content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+                    logger.info(f"📊 Created structured document with {len(structured_document.content_blocks)} blocks")
 
-            # Count image blocks
-            image_blocks = [block for block in structured_document.content_blocks if hasattr(block, 'image_path') and block.image_path]
-            logger.info(f"🖼️ Document contains {len(image_blocks)} image blocks")
+                    # Count image blocks and validate data integrity
+                    image_blocks = [block for block in structured_document.content_blocks if hasattr(block, 'image_path') and block.image_path]
+                    logger.info(f"🖼️ Document contains {len(image_blocks)} image blocks")
 
-            # STEP 2: Use advanced pipeline for translation only
-            logger.info("🔄 Step 2: Processing translation with advanced pipeline...")
-            advanced_result = await self.advanced_pipeline.process_document_advanced(
-                pdf_path=filepath,
-                output_dir=output_dir_for_this_file,
-                target_language=target_language
-            )
+                    add_metadata(
+                        content_blocks_count=len(structured_document.content_blocks),
+                        image_placeholders_found=len(image_blocks)
+                    )
 
-            # STEP 3: Apply translation to structured document
-            logger.info("🔧 Step 3: Applying translation to structured document...")
-            translated_document = self._apply_translation_to_structured_document(
-                structured_document, advanced_result.translated_text
-            )
+            # DATA-FLOW AUDIT: Validate structured document integrity
+            with span("validate_extraction_integrity", SpanType.VALIDATION):
+                self._validate_structured_document_integrity(structured_document, "after_extraction")
+
+            # STEP 2: Use parallel translation on structured document (MUCH FASTER!)
+            with span("parallel_translation", SpanType.TRANSLATION,
+                     translation_method="parallel_structured", target_language=target_language):
+                logger.info("🚀 Step 2: Processing translation with PARALLEL processing...")
+                logger.info("   🔥 Using structured document model for maximum speed")
+
+                translated_document = await translation_service.translate_document(
+                    structured_document, target_language, ""
+                )
+
+                add_metadata(
+                    translation_method="parallel_structured",
+                    blocks_translated=len(structured_document.get_translatable_blocks()),
+                    validation_passed=True
+                )
+
+                # Count preserved images
+                translated_image_blocks = [block for block in translated_document.content_blocks if hasattr(block, 'image_path') and block.image_path]
+                add_metadata(image_placeholders_preserved=len(translated_image_blocks))
+
+            # DATA-FLOW AUDIT: Validate translation preserved structure
+            with span("validate_translation_integrity", SpanType.VALIDATION):
+                self._validate_structured_document_integrity(translated_document, "after_translation")
+
+                # ASSERTION: Verify image preservation contract
+                original_image_count = len(image_blocks)
+                translated_image_count = len(translated_image_blocks)
+
+                assert original_image_count == translated_image_count, \
+                    f"Image preservation contract violated: {original_image_count} → {translated_image_count}"
+
+                logger.info(f"✅ Data integrity validated: {translated_image_count} images preserved")
+                add_metadata(validation_passed=True)
 
             # Generate documents from the translated structured document
             base_filename = os.path.splitext(os.path.basename(filepath))[0]
@@ -376,73 +934,87 @@ class UltimatePDFTranslator:
             # Extract cover page if enabled
             cover_page_data = None
             if config_manager.pdf_processing_settings['extract_cover_page']:
-                cover_page_data = self._extract_cover_page(filepath, output_dir_for_this_file)
+                cover_page_data = pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
 
             # Generate Word document using structured document model (preserves images!)
-            logger.info("📄 Generating Word document from translated structured document...")
-            logger.info(f"   🖼️ Including {len(image_blocks)} images from: {image_folder}")
+            with span("generate_word_document", SpanType.DOCUMENT_GENERATION,
+                     output_format="docx", images_included=len(image_blocks)):
+                logger.info("📄 Generating Word document from translated structured document...")
+                logger.info(f"   🖼️ Including {len(image_blocks)} images from: {image_folder}")
 
-            try:
-                saved_word_filepath = document_generator.create_word_document_from_structured_document(
-                    translated_document, word_output_path, image_folder, cover_page_data
-                )
+                try:
+                    saved_word_filepath = document_generator.create_word_document_from_structured_document(
+                        translated_document, word_output_path, image_folder, cover_page_data
+                    )
 
-                logger.debug(f"   • Document generator returned: {saved_word_filepath}")
+                    logger.debug(f"   • Document generator returned: {saved_word_filepath}")
 
-                if saved_word_filepath and os.path.exists(saved_word_filepath):
-                    file_size = os.path.getsize(saved_word_filepath)
-                    logger.info(f"✅ Word document created successfully: {file_size} bytes")
-                else:
-                    logger.error(f"❌ Document generator returned path but file doesn't exist!")
-                    logger.error(f"   • Returned path: {saved_word_filepath}")
-                    logger.error(f"   • Expected path: {word_output_path}")
-                    logger.error(f"   • File exists check: {os.path.exists(saved_word_filepath) if saved_word_filepath else 'N/A'}")
-                    raise Exception("Word document was not created - file missing after generation")
+                    if saved_word_filepath and os.path.exists(saved_word_filepath):
+                        file_size = os.path.getsize(saved_word_filepath)
+                        logger.info(f"✅ Word document created successfully: {file_size} bytes")
+                        add_metadata(output_file_size_bytes=file_size)
+                    else:
+                        logger.error(f"❌ Document generator returned path but file doesn't exist!")
+                        logger.error(f"   • Returned path: {saved_word_filepath}")
+                        logger.error(f"   • Expected path: {word_output_path}")
+                        logger.error(f"   • File exists check: {os.path.exists(saved_word_filepath) if saved_word_filepath else 'N/A'}")
+                        raise Exception("Word document was not created - file missing after generation")
 
-            except Exception as doc_error:
-                logger.error(f"❌ Document generation failed with error: {doc_error}")
-                logger.error(f"   • Structured document blocks: {len(translated_document.content_blocks) if translated_document else 'N/A'}")
-                logger.error(f"   • Target directory exists: {os.path.exists(output_dir_for_this_file)}")
-                logger.error(f"   • Target directory writable: {os.access(output_dir_for_this_file, os.W_OK)}")
-                raise Exception(f"Failed to create Word document from advanced translation: {doc_error}")
+                except Exception as doc_error:
+                    logger.error(f"❌ Document generation failed with error: {doc_error}")
+                    logger.error(f"   • Structured document blocks: {len(translated_document.content_blocks) if translated_document else 'N/A'}")
+                    logger.error(f"   • Target directory exists: {os.path.exists(output_dir_for_this_file)}")
+                    logger.error(f"   • Target directory writable: {os.access(output_dir_for_this_file, os.W_OK)}")
+                    add_metadata(error_count=1, validation_passed=False)
+                    raise Exception(f"Failed to create Word document from advanced translation: {doc_error}")
 
-            if not saved_word_filepath:
-                raise Exception("Failed to create Word document from advanced translation")
+                if not saved_word_filepath:
+                    add_metadata(error_count=1, validation_passed=False)
+                    raise Exception("Failed to create Word document from advanced translation")
 
             # Convert to PDF
-            logger.info("📑 Converting to PDF...")
-            pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
+            with span("convert_to_pdf", SpanType.DOCUMENT_GENERATION, output_format="pdf"):
+                logger.info("📑 Converting to PDF...")
+                pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
+                add_metadata(pdf_conversion_success=pdf_success)
 
             # Upload to Google Drive (if configured)
             drive_results = []
             if drive_uploader.is_available():
-                logger.info("☁️ Uploading to Google Drive...")
-                files_to_upload = [
-                    {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
-                ]
+                with span("upload_to_drive", SpanType.DOCUMENT_GENERATION):
+                    logger.info("☁️ Uploading to Google Drive...")
+                    files_to_upload = [
+                        {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
+                    ]
 
-                if pdf_success and os.path.exists(pdf_output_path):
-                    files_to_upload.append({
-                        'filepath': pdf_output_path,
-                        'filename': f"{base_filename}_translated.pdf"
-                    })
+                    if pdf_success and os.path.exists(pdf_output_path):
+                        files_to_upload.append({
+                            'filepath': pdf_output_path,
+                            'filename': f"{base_filename}_translated.pdf"
+                        })
 
-                drive_results = drive_uploader.upload_multiple_files(files_to_upload)
+                    drive_results = drive_uploader.upload_multiple_files(files_to_upload)
+                    add_metadata(files_uploaded=len(drive_results))
 
             # Generate enhanced final report
             end_time = time.time()
-            self._generate_advanced_final_report(
+            self._generate_structured_final_report(
                 filepath, output_dir_for_this_file, start_time, end_time,
-                advanced_result, drive_results, pdf_success
+                structured_document, translated_document, drive_results, pdf_success
             )
 
             # Save caches
             translation_service.save_caches()
 
+            # Finish distributed trace
+            finish_trace()
+
             logger.info("✅ Advanced translation workflow completed successfully!")
             return precomputed_style_guide
 
         except Exception as e:
+            # Finish trace on error
+            finish_trace()
             logger.error(f"❌ Advanced translation workflow failed: {e}")
             logger.info("🔄 Falling back to standard translation workflow...")
             return await self._translate_document_standard(
@@ -529,12 +1101,23 @@ class UltimatePDFTranslator:
             
             # Step 3: Extract structured content
             logger.info("📝 Step 3: Extracting structured content...")
-            structured_content = self.content_extractor.extract_structured_content_from_pdf(
+            document = self.content_extractor.extract_structured_content_from_pdf(
                 filepath, extracted_images
             )
 
-            if not structured_content:
+            if not document or not document.content_blocks:
                 raise Exception("No content could be extracted from the PDF")
+
+            # Convert Document to legacy format for standard workflow
+            from structured_document_model import convert_document_to_legacy_format
+            structured_content = convert_document_to_legacy_format(document)
+            logger.info(f"📋 Converted Document to legacy format: {len(structured_content)} items")
+            logger.debug(f"📋 Legacy content type: {type(structured_content)}")
+            if structured_content and len(structured_content) > 0:
+                logger.debug(f"📋 First item type: {type(structured_content[0])}")
+                logger.debug(f"📋 First item: {structured_content[0]}")
+            else:
+                logger.warning("📋 No content in legacy format!")
 
             # Step 3.5: Restructure text to separate footnotes
             logger.info("🔧 Step 3.5: Restructuring text and separating footnotes...")
@@ -733,6 +1316,59 @@ class UltimatePDFTranslator:
             logger.error(f"❌ Structured document translation failed: {e}")
             raise
 
+    async def translate_pdf_with_final_assembly(self, filepath, output_dir, target_language_override=None, precomputed_style_guide=None, cover_page_data=None):
+        """
+        COMPREHENSIVE FINAL ASSEMBLY APPROACH: Translate PDF using the new comprehensive strategy.
+
+        This method implements the hybrid parsing strategy that ensures TOC and visual elements
+        are correctly placed in the final document while bypassing image translation entirely.
+
+        Key Features:
+        - Parallel Nougat + PyMuPDF processing
+        - Intelligent visual element correlation
+        - Image bypass (no translation for visual content)
+        - Two-pass TOC generation with accurate page numbers
+        - High-fidelity document assembly
+        """
+        logger.info("🚀 Starting Final Assembly Translation Pipeline...")
+
+        try:
+            # Import the final assembly pipeline
+            from final_document_assembly_pipeline import FinalDocumentAssemblyPipeline
+
+            # Initialize the pipeline
+            pipeline = FinalDocumentAssemblyPipeline()
+
+            # Determine target language
+            target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
+
+            # Process PDF with comprehensive assembly strategy
+            results = await pipeline.process_pdf_with_final_assembly(
+                pdf_path=filepath,
+                output_dir=output_dir,
+                target_language=target_language
+            )
+
+            # Log results
+            if results['status'] == 'success':
+                logger.info("✅ Final Assembly Translation completed successfully!")
+                logger.info(f"📄 Word document: {os.path.basename(results['output_files']['word_document'])}")
+                logger.info(f"🖼️ Images preserved: {results['processing_statistics']['preserved_images']}")
+                logger.info(f"📋 TOC entries: {results['processing_statistics']['toc_entries']}")
+            else:
+                logger.warning(f"⚠️ Final Assembly Translation completed with issues: {results.get('validation_results', {}).get('issues', [])}")
+
+            return results
+
+        except ImportError:
+            logger.error("❌ Final Assembly Pipeline not available - falling back to standard structured approach")
+            return await self.translate_pdf_structured_document_model(filepath, output_dir, target_language_override, precomputed_style_guide, cover_page_data)
+
+        except Exception as e:
+            logger.error(f"❌ Final Assembly Translation failed: {e}")
+            logger.info("🔄 Falling back to standard structured approach...")
+            return await self.translate_pdf_structured_document_model(filepath, output_dir, target_language_override, precomputed_style_guide, cover_page_data)
+
     def _integrate_image_analysis_into_document(self, document, image_analysis):
         """Integrate image analysis results into Document object"""
         # Create a mapping of image filenames to analysis results
@@ -840,6 +1476,13 @@ class UltimatePDFTranslator:
 
     def _restructure_content_text(self, structured_content):
         """Restructure text content to separate footnotes from main content"""
+        logger.debug(f"📋 _restructure_content_text received: {type(structured_content)}")
+        logger.debug(f"📋 Is it a list? {isinstance(structured_content, list)}")
+        if hasattr(structured_content, 'content_blocks'):
+            logger.error(f"❌ ERROR: _restructure_content_text received Document object instead of list!")
+            logger.error(f"❌ Document has {len(structured_content.content_blocks)} content blocks")
+            raise TypeError("_restructure_content_text expects a list, but received a Document object")
+
         restructured_content = []
         footnotes_collected = []
 
@@ -1426,23 +2069,85 @@ class UltimatePDFTranslator:
 
         logger.info(report)
 
+    def _validate_structured_document_integrity(self, document, stage_name):
+        """
+        Data-flow audit: Validate structured document integrity at pipeline stages.
+
+        This implements Proposition 1: Data-Flow Audits in Architectural Design
+        """
+        if not document:
+            logger.error(f"❌ Data integrity check failed at {stage_name}: Document is None")
+            raise ValueError(f"Document integrity violation at {stage_name}: Document is None")
+
+        # Check basic document structure
+        if not hasattr(document, 'content_blocks'):
+            logger.error(f"❌ Data integrity check failed at {stage_name}: No content_blocks attribute")
+            raise ValueError(f"Document integrity violation at {stage_name}: Missing content_blocks")
+
+        # Count different types of content
+        total_blocks = len(document.content_blocks)
+        image_blocks = [block for block in document.content_blocks if hasattr(block, 'image_path') and block.image_path]
+        text_blocks = [block for block in document.content_blocks if hasattr(block, 'content') or hasattr(block, 'original_text')]
+
+        # Log data shape at this stage
+        logger.info(f"📊 Data integrity check at {stage_name}:")
+        logger.info(f"   • Total blocks: {total_blocks}")
+        logger.info(f"   • Image blocks: {len(image_blocks)}")
+        logger.info(f"   • Text blocks: {len(text_blocks)}")
+        logger.info(f"   • Document title: {getattr(document, 'title', 'N/A')}")
+        logger.info(f"   • Source filepath: {getattr(document, 'source_filepath', 'N/A')}")
+
+        # Validate image blocks have required attributes
+        for i, block in enumerate(image_blocks):
+            if not hasattr(block, 'image_path') or not block.image_path:
+                logger.warning(f"⚠️ Image block {i} missing image_path at {stage_name}")
+            elif not os.path.exists(block.image_path):
+                logger.warning(f"⚠️ Image file not found: {block.image_path} at {stage_name}")
+
+        # Store stage metadata for comparison
+        if not hasattr(self, '_data_flow_audit'):
+            self._data_flow_audit = {}
+
+        self._data_flow_audit[stage_name] = {
+            'total_blocks': total_blocks,
+            'image_blocks': len(image_blocks),
+            'text_blocks': len(text_blocks),
+            'timestamp': time.time()
+        }
+
+        logger.debug(f"✅ Data integrity validated at {stage_name}")
+
 async def main():
     """Main entry point for the application"""
     logger.info("--- ULTIMATE PDF TRANSLATOR (Modular Version) ---")
     
     # Validate configuration
-    issues, recommendations = config_manager.validate_configuration()
-    
-    if issues:
-        logger.error("❌ Configuration issues found:")
-        for issue in issues:
-            logger.error(f"  {issue}")
-        return False
-    
-    if recommendations:
-        logger.info("💡 Configuration recommendations:")
-        for rec in recommendations:
-            logger.info(f"  {rec}")
+    if UNIFIED_CONFIG_AVAILABLE:
+        # Use unified configuration validation
+        is_valid = config_manager.validate_config()
+        if not is_valid:
+            logger.error("❌ Configuration validation failed")
+            logger.warning("⚠️ Please check configuration file for errors")
+            return False
+        else:
+            logger.info("✅ Configuration validation passed")
+    else:
+        # Use legacy configuration validation
+        try:
+            issues, recommendations = config_manager.validate_configuration()
+
+            if issues:
+                logger.error("❌ Configuration issues found:")
+                for issue in issues:
+                    logger.error(f"  {issue}")
+                return False
+
+            if recommendations:
+                logger.info("💡 Configuration recommendations:")
+                for rec in recommendations:
+                    logger.info(f"  {rec}")
+        except AttributeError:
+            logger.warning("⚠️ Configuration validation not available, proceeding with defaults")
     
     # Get input files
     input_path, process_mode = choose_input_path()
@@ -1476,30 +2181,122 @@ async def main():
     if len(files_to_process) == 1:
         estimate_translation_cost(files_to_process[0], config_manager)
     
-    # Initialize translator
+    # Initialize translator and failure tracker
     translator = UltimatePDFTranslator()
-    
-    # Process files
+    failure_tracker = FailureTracker(
+        quarantine_dir=os.path.join(main_output_directory, "quarantine"),
+        max_retries=3
+    )
+
+    # Process files with quarantine system
+    processed_count = 0
+    quarantined_count = 0
+
     for i, filepath in enumerate(files_to_process):
         logger.info(f"\n>>> Processing file {i+1}/{len(files_to_process)}: {os.path.basename(filepath)} <<<")
-        
+
+        # Check if file should be processed or is quarantined
+        if not failure_tracker.should_process_file(filepath):
+            logger.warning(f"⚠️ Skipping quarantined file: {os.path.basename(filepath)}")
+            quarantined_count += 1
+            continue
+
         specific_output_dir = get_specific_output_dir_for_file(main_output_directory, filepath)
         if not specific_output_dir:
             logger.error(f"Could not create output directory for {os.path.basename(filepath)}")
             continue
-        
+
         try:
             await translator.translate_document_async(filepath, specific_output_dir)
+            processed_count += 1
+            logger.info(f"✅ Successfully processed: {os.path.basename(filepath)}")
+
         except Exception as e:
-            logger.error(f"Failed to process {os.path.basename(filepath)}: {e}")
-        
+            logger.error(f"❌ Failed to process {os.path.basename(filepath)}: {e}")
+
+            # Record failure and check if file should be quarantined
+            was_quarantined = failure_tracker.record_failure(filepath, e)
+            if was_quarantined:
+                quarantined_count += 1
+                logger.warning(f"🚨 File quarantined after repeated failures")
+            else:
+                failure_count = failure_tracker.failure_counts[failure_tracker.get_file_hash(filepath)]
+                logger.warning(f"⚠️ Failure {failure_count}/{failure_tracker.max_retries} recorded for this file")
+
         # Pause between files
         if i < len(files_to_process) - 1:
             logger.info("Pausing before next file...")
             time.sleep(3)
     
+    # Final processing summary
     logger.info("--- ALL PROCESSING COMPLETED ---")
-    return True
+    logger.info(f"📊 Processing Summary:")
+    logger.info(f"   ✅ Successfully processed: {processed_count} files")
+    logger.info(f"   🚨 Quarantined files: {quarantined_count} files")
+    logger.info(f"   📁 Total files attempted: {len(files_to_process)} files")
+
+    if quarantined_count > 0:
+        logger.warning(f"⚠️ {quarantined_count} files were quarantined due to repeated failures")
+        logger.warning(f"   📁 Check quarantine directory: {failure_tracker.quarantine_dir}")
+        logger.warning(f"   📋 Review error reports for manual inspection")
+
+        return processed_count > 0
+
+    def _generate_structured_final_report(self, input_filepath, output_dir, start_time, end_time,
+                                        original_document, translated_document, drive_results, pdf_success):
+        """Generate final report for structured document translation"""
+        duration = end_time - start_time
+
+        # Get statistics
+        original_stats = original_document.get_statistics() if original_document else {}
+        translated_stats = translated_document.get_statistics() if translated_document else {}
+
+        # Build files section
+        base_filename = os.path.splitext(os.path.basename(input_filepath))[0]
+        word_file = f"{base_filename}_translated.docx"
+        pdf_file = f"{base_filename}_translated.pdf"
+
+        files_section = f"""📁 OUTPUT FILES:
+• Word Document: {word_file} {'✅' if os.path.exists(os.path.join(output_dir, word_file)) else '❌'}
+• PDF Document: {pdf_file} {'✅' if pdf_success else '❌'}"""
+
+        # Build statistics section
+        stats_section = f"""📊 TRANSLATION STATISTICS:
+• Original blocks: {original_stats.get('total_blocks', 0)}
+• Translated blocks: {translated_stats.get('total_blocks', 0)}
+• Total pages: {original_stats.get('total_pages', 0)}
+• Translatable blocks: {original_stats.get('translatable_blocks', 0)}
+
+📋 CONTENT BREAKDOWN:"""
+
+        for content_type, count in original_stats.get('blocks_by_type', {}).items():
+            stats_section += f"\n• {content_type.replace('_', ' ').title()}: {count}"
+
+        report = f"""
+🎉 STRUCTURED DOCUMENT TRANSLATION COMPLETED {'SUCCESSFULLY' if pdf_success else 'WITH WARNINGS'}!
+=================================================================
+
+📁 Input: {os.path.basename(input_filepath)}
+📁 Output Directory: {output_dir}
+⏱️ Total Time: {duration/60:.1f} minutes
+
+{files_section}
+
+{stats_section}
+"""
+
+        if drive_results:
+            from google_drive_uploader import drive_uploader
+            report += f"\n{drive_uploader.get_upload_summary(drive_results)}"
+
+        if not pdf_success:
+            report += f"""
+⚠️ PDF CONVERSION WARNINGS:
+• PDF conversion failed, but Word document was created successfully
+• You can manually convert the Word document to PDF if needed
+"""
+
+        logger.info(report)
 
 if __name__ == "__main__":
     # Set up logging

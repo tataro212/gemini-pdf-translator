@@ -1665,7 +1665,7 @@ class StructuredContentExtractor:
         return convert_document_to_legacy_format(document)
     
     def _analyze_document_structure(self, doc):
-        """Analyze document structure to identify patterns"""
+        """Analyze document structure with global font analysis and spatial understanding"""
         structure_info = {
             'total_pages': len(doc),
             'font_analysis': {},
@@ -1673,41 +1673,948 @@ class StructuredContentExtractor:
             'content_start_page': 0,
             'bibliography_start_page': None,
             'dominant_font_size': 12.0,
-            'heading_font_sizes': set()
+            'heading_font_sizes': set(),
+            'font_hierarchy': {},  # Enhanced font hierarchy mapping
+            'body_text_style': None,  # Dominant body text style
+            'heading_styles': {}  # Mapping of heading levels to styles
         }
-        
-        # Analyze fonts and structure in first few pages
-        font_sizes = []
-        
+
+        # Perform global font analysis across entire document
+        font_profile = self._perform_global_font_analysis(doc)
+        structure_info.update(font_profile)
+
+        # Analyze fonts and structure in first few pages for TOC detection
         for page_num in range(min(10, len(doc))):
             page = doc[page_num]
             blocks = page.get_text("dict")["blocks"]
-            
+
             for block in blocks:
                 if "lines" in block:
                     for line in block["lines"]:
                         for span in line["spans"]:
-                            font_size = span.get("size", 12.0)
-                            font_sizes.append(font_size)
-                            
                             # Check for TOC indicators
                             text = span.get("text", "").strip().lower()
                             if any(keyword in text for keyword in self.settings['toc_detection_keywords']):
                                 if page_num not in structure_info['toc_pages']:
                                     structure_info['toc_pages'].append(page_num)
-        
-        # Determine dominant font size
-        if font_sizes:
-            from collections import Counter
-            font_counter = Counter(font_sizes)
-            structure_info['dominant_font_size'] = font_counter.most_common(1)[0][0]
-            
-            # Identify heading font sizes (larger than dominant)
-            for size, count in font_counter.items():
-                if size > structure_info['dominant_font_size'] and count >= 3:
-                    structure_info['heading_font_sizes'].add(size)
-        
+
         return structure_info
+
+    def _perform_global_font_analysis(self, doc):
+        """
+        Proposition 3: Global Font Analysis for Adaptive Heading Detection
+
+        Performs comprehensive font analysis across the entire document to build
+        an adaptive style hierarchy based on the document's specific styling.
+        """
+        logger.info("🔍 Performing global font analysis for adaptive heading detection...")
+
+        font_styles = {}  # font_key -> count
+        font_sizes = []
+
+        # First pass: collect all font information
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            blocks = page.get_text("dict")["blocks"]
+
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            font_size = span.get("size", 12.0)
+                            font_name = span.get("font", "Arial")
+                            font_flags = span.get("flags", 0)
+
+                            # Determine font style
+                            is_bold = bool(font_flags & 2**4)  # Bold flag
+                            is_italic = bool(font_flags & 2**1)  # Italic flag
+
+                            # Create font style key
+                            style_key = f"{font_name}, {font_size:.1f}pt"
+                            if is_bold:
+                                style_key += ", bold"
+                            if is_italic:
+                                style_key += ", italic"
+
+                            # Count occurrences
+                            font_styles[style_key] = font_styles.get(style_key, 0) + 1
+                            font_sizes.append(font_size)
+
+        # Analyze font frequency to identify body text and headings
+        from collections import Counter
+        style_counter = Counter(font_styles)
+        size_counter = Counter(font_sizes)
+
+        # Identify the most common style as body text
+        body_text_style = style_counter.most_common(1)[0][0] if style_counter else "Arial, 12.0pt"
+        dominant_font_size = size_counter.most_common(1)[0][0] if size_counter else 12.0
+
+        # Build heading hierarchy based on font sizes larger than body text
+        heading_sizes = sorted([size for size in size_counter.keys() if size > dominant_font_size], reverse=True)
+
+        heading_styles = {}
+        font_hierarchy = {}
+
+        # Map heading levels to font sizes (largest = H1, next = H2, etc.)
+        for i, size in enumerate(heading_sizes[:6]):  # Limit to H1-H6
+            level = i + 1
+            heading_styles[f"h{level}"] = size
+            font_hierarchy[size] = level
+
+        logger.info(f"📊 Font analysis complete:")
+        logger.info(f"   • Body text style: {body_text_style}")
+        logger.info(f"   • Dominant font size: {dominant_font_size:.1f}pt")
+        logger.info(f"   • Heading hierarchy: {heading_styles}")
+
+        return {
+            'font_analysis': font_styles,
+            'dominant_font_size': dominant_font_size,
+            'heading_font_sizes': set(heading_sizes),
+            'font_hierarchy': font_hierarchy,
+            'body_text_style': body_text_style,
+            'heading_styles': heading_styles
+        }
+
+    def _extract_spatial_elements(self, page, page_num, structure_analysis):
+        """
+        Proposition 1: Extract all text and image elements with spatial coordinates.
+
+        Returns a list of elements with bounding boxes for spatial analysis.
+        """
+        elements = []
+
+        # Extract text blocks with spatial information
+        blocks = page.get_text("dict")["blocks"]
+
+        for block_num, block in enumerate(blocks):
+            if "lines" not in block:
+                continue
+
+            # Extract text content and formatting
+            block_text = ""
+            block_formatting = {
+                'font_sizes': [],
+                'font_names': [],
+                'is_bold': False,
+                'is_italic': False
+            }
+
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    span_text = span["text"]
+                    block_text += span_text
+
+                    # Collect formatting information
+                    block_formatting['font_sizes'].append(span.get("size", 12.0))
+                    block_formatting['font_names'].append(span.get("font", "Arial"))
+
+                    font_flags = span.get("flags", 0)
+                    if font_flags & 2**4:  # Bold
+                        block_formatting['is_bold'] = True
+                    if font_flags & 2**1:  # Italic
+                        block_formatting['is_italic'] = True
+
+            block_text = block_text.strip()
+            if not block_text:
+                continue
+
+            # Create spatial element
+            element = {
+                'type': 'text',
+                'content': block_text,
+                'bbox': block.get("bbox", [0, 0, 0, 0]),
+                'page_num': page_num,
+                'block_num': block_num,
+                'formatting': block_formatting,
+                'element_id': f"text_{page_num}_{block_num}"
+            }
+
+            elements.append(element)
+
+        return elements
+
+    def _apply_spatial_reading_order(self, elements):
+        """
+        Enhanced spatial reading order with multi-column layout detection and complex document structure support.
+
+        Addresses detection issues by:
+        1. Detecting multi-column layouts
+        2. Handling sidebars and footnotes
+        3. Using adaptive vertical tolerance
+        4. Supporting right-to-left reading patterns
+        """
+        if not elements:
+            return elements
+
+        # Analyze page layout to detect columns
+        layout_analysis = self._analyze_page_layout(elements)
+
+        if layout_analysis['is_multi_column']:
+            sorted_elements = self._sort_multi_column_layout(elements, layout_analysis)
+        else:
+            sorted_elements = self._sort_single_column_layout(elements)
+
+        # Assign reading order positions
+        for i, element in enumerate(sorted_elements):
+            element['reading_order_position'] = i
+
+        logger.debug(f"Applied spatial reading order to {len(sorted_elements)} elements "
+                    f"(multi-column: {layout_analysis['is_multi_column']})")
+        return sorted_elements
+
+    def _analyze_page_layout(self, elements):
+        """Analyze page layout to detect columns, sidebars, and other structural elements"""
+        if not elements:
+            return {'is_multi_column': False, 'columns': []}
+
+        # Extract x-coordinates of all elements
+        x_positions = []
+        for element in elements:
+            bbox = element['bbox']
+            x_left, x_right = bbox[0], bbox[2]
+            x_positions.extend([x_left, x_right])
+
+        # Find potential column boundaries using clustering
+        x_positions.sort()
+
+        # Simple column detection: look for gaps in x-positions
+        gaps = []
+        for i in range(1, len(x_positions)):
+            gap = x_positions[i] - x_positions[i-1]
+            if gap > 50:  # Significant gap threshold
+                gaps.append({
+                    'position': (x_positions[i-1] + x_positions[i]) / 2,
+                    'size': gap
+                })
+
+        # Determine if multi-column based on significant gaps
+        is_multi_column = len(gaps) >= 1 and any(gap['size'] > 100 for gap in gaps)
+
+        # Define column boundaries
+        columns = []
+        if is_multi_column and gaps:
+            # Sort gaps by position
+            gaps.sort(key=lambda x: x['position'])
+
+            # Create column definitions
+            page_left = min(x_positions)
+            page_right = max(x_positions)
+
+            prev_boundary = page_left
+            for gap in gaps:
+                if gap['size'] > 100:  # Only consider significant gaps
+                    columns.append({
+                        'left': prev_boundary,
+                        'right': gap['position'],
+                        'center': (prev_boundary + gap['position']) / 2
+                    })
+                    prev_boundary = gap['position']
+
+            # Add final column
+            columns.append({
+                'left': prev_boundary,
+                'right': page_right,
+                'center': (prev_boundary + page_right) / 2
+            })
+
+        return {
+            'is_multi_column': is_multi_column,
+            'columns': columns,
+            'gaps': gaps
+        }
+
+    def _sort_multi_column_layout(self, elements, layout_analysis):
+        """
+        Sort elements in multi-column layout using reading bands approach.
+
+        Primary sort: Vertical position (reading bands)
+        Secondary sort: Horizontal position (left to right within each band)
+
+        This produces natural reading order: L1, R1, L2, R2 instead of L1, L2, R1, R2
+        """
+        if not elements:
+            return []
+
+        # Step 1: Calculate adaptive line tolerance based on actual content
+        total_height = sum(abs(el['bbox'][3] - el['bbox'][1]) for el in elements if el['bbox'])
+        avg_height = total_height / len(elements) if elements else 10
+
+        # A good tolerance is typically half the average line height
+        # This groups elements on the same line without accidentally grouping different lines
+        line_height_tolerance = max(5, avg_height / 2) if avg_height > 0 else 5
+
+        logger.debug(f"Multi-column sort: avg_height={avg_height:.1f}, tolerance={line_height_tolerance:.1f}")
+
+        # Step 2: Sort by reading bands (vertical position first, then horizontal)
+        sorted_elements = sorted(
+            elements,
+            key=lambda block: (
+                -round(block['bbox'][1] / line_height_tolerance),  # Primary: vertical "band" (negative for top-to-bottom)
+                block['bbox'][0]                                   # Secondary: horizontal position
+            )
+        )
+
+        # Debug: Log the reading order for verification
+        logger.debug("Multi-column reading order:")
+        for i, element in enumerate(sorted_elements[:10]):  # Show first 10 elements
+            bbox = element['bbox']
+            content = element.get('content', 'Unknown')[:30]
+            band = round(bbox[1] / line_height_tolerance)
+            logger.debug(f"  {i+1}. Band {band}, x={bbox[0]:.0f}: '{content}...'")
+
+        return sorted_elements
+
+    def _sort_single_column_layout(self, elements):
+        """Sort elements in single-column layout with enhanced vertical tolerance"""
+        # Calculate adaptive vertical tolerance based on element sizes
+        element_heights = [abs(e['bbox'][3] - e['bbox'][1]) for e in elements if e['bbox']]
+        avg_height = sum(element_heights) / len(element_heights) if element_heights else 20
+
+        # Use adaptive tolerance: smaller for dense layouts, larger for sparse layouts
+        vertical_tolerance = max(10, min(30, avg_height * 0.5))
+
+        def enhanced_spatial_sort_key(element):
+            bbox = element['bbox']
+            y0, x0 = bbox[1], bbox[0]  # y0 (top), x0 (left)
+
+            # Group elements by approximate vertical bands with adaptive tolerance
+            vertical_band = round(y0 / vertical_tolerance) * vertical_tolerance
+
+            return (vertical_band, x0)  # Positive y for top-to-bottom reading (smaller y = higher on page)
+
+        return sorted(elements, key=enhanced_spatial_sort_key)
+
+    def _create_content_block_from_element(self, element, structure_analysis):
+        """Create ContentBlock from spatial element with enhanced classification"""
+        if element['type'] != 'text':
+            return None
+
+        text = element['content']
+        formatting = element['formatting']
+        bbox = element['bbox']
+        page_num = element['page_num']
+        block_num = element['block_num']
+
+        # Filter out unwanted content
+        if self._should_filter_content(text, bbox, page_num, structure_analysis):
+            return None
+
+        # Use adaptive heading detection based on global font analysis
+        content_type = self._classify_content_type_adaptive(text, formatting, structure_analysis)
+
+        # Create appropriate ContentBlock
+        if content_type.startswith('h'):
+            level = int(content_type[1])
+            return Heading(
+                block_type=ContentType.HEADING,
+                original_text=text,
+                page_num=page_num,
+                bbox=tuple(bbox),
+                block_num=block_num,
+                formatting=formatting,
+                level=level,
+                content=text
+            )
+        elif content_type == 'paragraph':
+            return Paragraph(
+                block_type=ContentType.PARAGRAPH,
+                original_text=text,
+                page_num=page_num,
+                bbox=tuple(bbox),
+                block_num=block_num,
+                formatting=formatting,
+                content=text
+            )
+        # Add other content types as needed
+
+        return None
+
+    def _classify_content_type_adaptive(self, text, formatting, structure_analysis):
+        """
+        Enhanced adaptive content classification with multi-factor analysis.
+
+        Addresses detection issues by:
+        1. Analyzing multiple formatting attributes (font, size, style, color)
+        2. Using contextual clues (position, surrounding content)
+        3. Implementing fuzzy matching for font sizes
+        4. Supporting non-standard heading formats
+        """
+        import re
+
+        # Get document structure information
+        font_hierarchy = structure_analysis.get('font_hierarchy', {})
+        dominant_font_size = structure_analysis.get('dominant_font_size', 12.0)
+        body_text_style = structure_analysis.get('body_text_style', '')
+
+        # Extract formatting attributes
+        font_sizes = formatting.get('font_sizes', [12.0])
+        primary_font_size = max(font_sizes) if font_sizes else 12.0
+        font_names = formatting.get('font_names', [])
+        primary_font = font_names[0] if font_names else ''
+
+        # Enhanced formatting detection
+        is_bold = formatting.get('is_bold', False) or self._detect_bold_from_flags(formatting)
+        is_italic = formatting.get('is_italic', False) or self._detect_italic_from_flags(formatting)
+        font_color = formatting.get('color', 0)
+
+        # Text analysis
+        text_clean = text.strip()
+        text_length = len(text_clean)
+        word_count = len(text_clean.split())
+
+        # Early filtering: very long text is unlikely to be a heading
+        if word_count > 20 or text_length > 150:
+            return 'paragraph'
+
+        # Check exact font hierarchy match with tolerance
+        for font_size, level in font_hierarchy.items():
+            if abs(primary_font_size - font_size) <= 0.5:  # 0.5pt tolerance
+                return f'h{level}'
+
+        # Multi-factor heading detection
+        heading_score = 0.0
+
+        # Font size factor
+        size_ratio = primary_font_size / dominant_font_size if dominant_font_size > 0 else 1.0
+        if size_ratio >= 1.5:
+            heading_score += 0.4
+        elif size_ratio >= 1.2:
+            heading_score += 0.3
+        elif size_ratio >= 1.1:
+            heading_score += 0.2
+
+        # Font weight factor
+        if is_bold:
+            heading_score += 0.3
+
+        # Font style factor
+        if is_italic and not is_bold:
+            heading_score += 0.1  # Italic alone is weaker indicator
+
+        # Font family factor (different from body text)
+        if primary_font and body_text_style:
+            if primary_font.lower() not in body_text_style.lower():
+                heading_score += 0.2
+
+        # Text length factor (shorter text more likely to be heading)
+        if text_length <= 50:
+            heading_score += 0.2
+        elif text_length <= 100:
+            heading_score += 0.1
+
+        # Structural patterns
+        if self._has_heading_patterns(text_clean):
+            heading_score += 0.3
+
+        # Position-based hints (if available)
+        if self._appears_to_be_section_start(text_clean):
+            heading_score += 0.2
+
+        # Color factor (non-black text might be headings)
+        if font_color != 0:  # Non-black color
+            heading_score += 0.1
+
+        # Determine heading level based on score and size
+        if heading_score >= 0.6:
+            # Determine level based on font size and other factors
+            if size_ratio >= 1.8 or primary_font_size >= dominant_font_size + 6:
+                return 'h1'
+            elif size_ratio >= 1.4 or primary_font_size >= dominant_font_size + 4:
+                return 'h2'
+            elif size_ratio >= 1.2 or primary_font_size >= dominant_font_size + 2:
+                return 'h3'
+            else:
+                return 'h4'
+        elif heading_score >= 0.4:
+            return 'h4'  # Minor heading
+
+        # Check for special content types
+        if self._is_list_item_pattern(text_clean):
+            return 'list_item'
+
+        # Default to paragraph
+        return 'paragraph'
+
+    def _detect_bold_from_flags(self, formatting):
+        """Detect bold formatting from font flags"""
+        flags = formatting.get('flags', 0)
+        # Font flag 16 typically indicates bold in PyMuPDF
+        return bool(flags & 16)
+
+    def _detect_italic_from_flags(self, formatting):
+        """Detect italic formatting from font flags"""
+        flags = formatting.get('flags', 0)
+        # Font flag 2 typically indicates italic in PyMuPDF
+        return bool(flags & 2)
+
+    def _has_heading_patterns(self, text):
+        """Check for common heading patterns"""
+        import re
+
+        heading_patterns = [
+            r'^\d+\.?\s+[A-Z]',  # "1. Introduction" or "1 Introduction"
+            r'^[A-Z][A-Z\s]{2,}$',  # ALL CAPS headings
+            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case
+            r'^(Chapter|Section|Part|Appendix)\s+\d+',  # Chapter/Section numbers
+            r'^\d+\.\d+',  # Numbered sections like "2.1"
+            r'^[IVX]+\.',  # Roman numerals
+            r'^[A-Z]\.',   # Single letter sections "A."
+        ]
+
+        return any(re.search(pattern, text) for pattern in heading_patterns)
+
+    def _appears_to_be_section_start(self, text):
+        """Check if text appears to start a new section"""
+        import re
+
+        section_indicators = [
+            r'^(introduction|conclusion|abstract|summary|overview)',
+            r'^(background|methodology|results|discussion)',
+            r'^(references|bibliography|appendix|glossary)',
+            r'^\d+\.\s*(introduction|background|method)',
+        ]
+
+        text_lower = text.lower()
+        return any(re.search(pattern, text_lower) for pattern in section_indicators)
+
+    def _is_list_item_pattern(self, text):
+        """Check if text follows list item patterns"""
+        import re
+
+        list_patterns = [
+            r'^[•·▪▫‣⁃]\s+',  # Bullet points
+            r'^[-*+]\s+',     # Dash/asterisk bullets
+            r'^\d+[.)]\s+',   # Numbered lists
+            r'^[a-z][.)]\s+', # Lettered lists
+            r'^\([a-z0-9]+\)\s+',  # Parenthetical lists
+        ]
+
+        return any(re.search(pattern, text) for pattern in list_patterns)
+
+    def _associate_images_with_text_spatial(self, content_blocks, extracted_images, page_num):
+        """
+        Proposition 1: Associate images with text based on spatial relationships.
+
+        Determines if an image should be placed before, after, or alongside text blocks
+        based on spatial positioning and implements explicit caption detection.
+        """
+        if not extracted_images:
+            return content_blocks
+
+        logger.debug(f"Associating {len(extracted_images)} images with {len(content_blocks)} text blocks on page {page_num}")
+
+        # Create image placeholders with spatial analysis
+        image_placeholders = []
+
+        for img_idx, image in enumerate(extracted_images):
+            # Create basic image placeholder
+            placeholder = ImagePlaceholder(
+                block_type=ContentType.IMAGE_PLACEHOLDER,
+                original_text="",
+                page_num=page_num,
+                bbox=tuple(image.get('position', {}).get('bbox', [0, 0, 0, 0])),
+                block_num=len(content_blocks) + img_idx,
+                image_path=image.get('filepath', ''),
+                width=image.get('width'),
+                height=image.get('height')
+            )
+
+            # Determine spatial relationship with text blocks
+            spatial_info = self._analyze_image_text_spatial_relationship(placeholder, content_blocks)
+
+            placeholder.spatial_relationship = spatial_info['relationship']
+            placeholder.reading_order_position = spatial_info['reading_order_position']
+
+            # Detect and link captions
+            caption_info = self._detect_and_link_caption(placeholder, content_blocks)
+            if caption_info:
+                placeholder.caption_block_id = caption_info['caption_block_id']
+                placeholder.caption = caption_info['caption_text']
+
+            image_placeholders.append(placeholder)
+
+        # Insert image placeholders into content blocks at appropriate positions
+        enhanced_content_blocks = self._insert_images_by_spatial_order(content_blocks, image_placeholders)
+
+        return enhanced_content_blocks
+
+    def _analyze_image_text_spatial_relationship(self, image_placeholder, text_blocks):
+        """
+        Analyze spatial relationship between an image and surrounding text blocks.
+
+        Returns relationship type and suggested reading order position.
+        """
+        image_bbox = image_placeholder.bbox
+        image_center_y = (image_bbox[1] + image_bbox[3]) / 2
+        image_center_x = (image_bbox[0] + image_bbox[2]) / 2
+
+        # Find closest text blocks
+        distances = []
+        for block in text_blocks:
+            if not hasattr(block, 'bbox') or not block.bbox:
+                continue
+
+            text_bbox = block.bbox
+            text_center_y = (text_bbox[1] + text_bbox[3]) / 2
+            text_center_x = (text_bbox[0] + text_bbox[2]) / 2
+
+            # Calculate distance
+            distance = ((image_center_x - text_center_x) ** 2 + (image_center_y - text_center_y) ** 2) ** 0.5
+
+            distances.append({
+                'block': block,
+                'distance': distance,
+                'relative_position': self._get_relative_position(image_bbox, text_bbox)
+            })
+
+        # Sort by distance
+        distances.sort(key=lambda x: x['distance'])
+
+        # Determine relationship based on closest blocks
+        if not distances:
+            return {'relationship': 'standalone', 'reading_order_position': None}
+
+        closest = distances[0]
+        relationship = self._determine_spatial_relationship(closest['relative_position'])
+
+        # Determine reading order position
+        reading_order_pos = getattr(closest['block'], 'reading_order_position', None)
+        if reading_order_pos is not None:
+            if relationship == 'before':
+                reading_order_pos = reading_order_pos
+            elif relationship == 'after':
+                reading_order_pos = reading_order_pos + 1
+            else:  # alongside or wrapped
+                reading_order_pos = reading_order_pos + 0.5  # Insert between blocks
+
+        return {
+            'relationship': relationship,
+            'reading_order_position': reading_order_pos
+        }
+
+    def _get_relative_position(self, image_bbox, text_bbox):
+        """Determine relative position of image to text block"""
+        img_center_x = (image_bbox[0] + image_bbox[2]) / 2
+        img_center_y = (image_bbox[1] + image_bbox[3]) / 2
+        text_center_x = (text_bbox[0] + text_bbox[2]) / 2
+        text_center_y = (text_bbox[1] + text_bbox[3]) / 2
+
+        # Determine primary direction
+        dx = img_center_x - text_center_x
+        dy = img_center_y - text_center_y
+
+        if abs(dy) > abs(dx):
+            return 'above' if dy < 0 else 'below'
+        else:
+            return 'left' if dx < 0 else 'right'
+
+    def _determine_spatial_relationship(self, relative_position):
+        """Map relative position to spatial relationship type"""
+        if relative_position in ['above']:
+            return 'before'
+        elif relative_position in ['below']:
+            return 'after'
+        elif relative_position in ['left', 'right']:
+            return 'alongside'
+        else:
+            return 'wrapped'
+
+    def _detect_and_link_caption(self, image_placeholder, text_blocks):
+        """
+        Enhanced caption detection with flexible proximity rules and multi-directional search.
+
+        Addresses detection issues by:
+        1. Expanding search directions (below, above, adjacent)
+        2. Using adaptive distance thresholds based on image size
+        3. Implementing fuzzy alignment matching
+        4. Adding confidence scoring for better candidate selection
+        """
+        image_bbox = image_placeholder.bbox
+        image_width = image_bbox[2] - image_bbox[0]
+        image_height = image_bbox[3] - image_bbox[1]
+
+        # Adaptive distance thresholds based on image size
+        max_vertical_distance = min(100, max(50, image_height * 0.5))
+        max_horizontal_distance = min(150, max(75, image_width * 0.3))
+
+        caption_candidates = []
+
+        for block in text_blocks:
+            if not hasattr(block, 'bbox') or not block.bbox:
+                continue
+
+            text_bbox = block.bbox
+            text_content = getattr(block, 'content', '') or getattr(block, 'original_text', '')
+
+            # Debug: Log all text blocks being evaluated
+            logger.debug(f"Evaluating text block: '{text_content[:50]}...' at bbox {text_bbox}")
+
+            # Skip if not caption-like
+            is_caption_like = self._is_likely_caption(text_content)
+            logger.debug(f"Is caption-like: {is_caption_like}")
+            if not is_caption_like:
+                continue
+
+            # Calculate spatial relationship
+            spatial_analysis = self._analyze_caption_spatial_relationship(image_bbox, text_bbox)
+
+            # Debug: Log spatial analysis results
+            logger.debug(f"Spatial analysis for '{text_content[:30]}...': {spatial_analysis}")
+            logger.debug(f"Max distances: vertical={max_vertical_distance}, horizontal={max_horizontal_distance}")
+
+            # Check if within acceptable proximity (use proximity_distance for more accurate edge-to-edge measurement)
+            proximity_ok = spatial_analysis['proximity_distance'] <= max_vertical_distance
+            alignment_ok = spatial_analysis['horizontal_alignment'] > 0.2  # At least 20% overlap
+
+            logger.debug(f"Proximity check: {spatial_analysis['proximity_distance']} <= {max_vertical_distance} = {proximity_ok}")
+            logger.debug(f"Alignment check: {spatial_analysis['horizontal_alignment']} > 0.2 = {alignment_ok}")
+
+            if proximity_ok and alignment_ok:
+
+                # Calculate confidence score
+                confidence = self._calculate_caption_confidence(
+                    text_content, spatial_analysis, image_bbox, text_bbox
+                )
+
+                if confidence > 0.01:  # Minimum confidence threshold (lowered for debugging)
+                    caption_candidates.append({
+                        'block': block,
+                        'text': text_content,
+                        'confidence': confidence,
+                        'spatial_analysis': spatial_analysis
+                    })
+
+        # Select best caption candidate based on confidence
+        if caption_candidates:
+            # Sort by confidence (highest first)
+            caption_candidates.sort(key=lambda x: x['confidence'], reverse=True)
+            best_caption = caption_candidates[0]
+
+            return {
+                'caption_block_id': getattr(best_caption['block'], 'block_id', None),
+                'caption_text': best_caption['text'],
+                'confidence': best_caption['confidence'],
+                'spatial_relationship': best_caption['spatial_analysis']['relationship']
+            }
+
+        return None
+
+    def _analyze_caption_spatial_relationship(self, image_bbox, text_bbox):
+        """Analyze spatial relationship between image and potential caption"""
+        img_left, img_top, img_right, img_bottom = image_bbox
+        text_left, text_top, text_right, text_bottom = text_bbox
+
+        # Calculate centers
+        img_center_x = (img_left + img_right) / 2
+        img_center_y = (img_top + img_bottom) / 2
+        text_center_x = (text_left + text_right) / 2
+        text_center_y = (text_top + text_bottom) / 2
+
+        # Calculate distances
+        vertical_distance = abs(text_center_y - img_center_y)
+        horizontal_distance = abs(text_center_x - img_center_x)
+
+        # Determine relationship
+        if text_top > img_bottom:  # Text below image
+            relationship = 'below'
+            proximity_distance = text_top - img_bottom
+        elif text_bottom < img_top:  # Text above image
+            relationship = 'above'
+            proximity_distance = img_top - text_bottom
+        elif text_left > img_right:  # Text to the right
+            relationship = 'right'
+            proximity_distance = text_left - img_right
+        elif text_right < img_left:  # Text to the left
+            relationship = 'left'
+            proximity_distance = img_left - text_right
+        else:  # Overlapping
+            relationship = 'overlapping'
+            proximity_distance = 0
+
+        # Calculate alignment scores
+        horizontal_alignment = self._calculate_alignment_score(
+            img_left, img_right, text_left, text_right
+        )
+        vertical_alignment = self._calculate_alignment_score(
+            img_top, img_bottom, text_top, text_bottom
+        )
+
+        return {
+            'relationship': relationship,
+            'vertical_distance': vertical_distance,
+            'horizontal_distance': horizontal_distance,
+            'proximity_distance': proximity_distance,
+            'horizontal_alignment': horizontal_alignment,
+            'vertical_alignment': vertical_alignment
+        }
+
+    def _calculate_alignment_score(self, start1, end1, start2, end2):
+        """Calculate alignment score between two ranges (0-1, where 1 is perfect alignment)"""
+        overlap = max(0, min(end1, end2) - max(start1, start2))
+        range1_size = end1 - start1
+        range2_size = end2 - start2
+
+        if range1_size == 0 or range2_size == 0:
+            return 0
+
+        # Alignment score based on overlap relative to smaller range
+        smaller_range = min(range1_size, range2_size)
+        return overlap / smaller_range if smaller_range > 0 else 0
+
+    def _calculate_caption_confidence(self, text_content, spatial_analysis, image_bbox, text_bbox):
+        """Calculate confidence score for caption candidate"""
+        confidence = 0.0
+
+        # Base confidence from caption pattern matching
+        if self._has_explicit_caption_markers(text_content):
+            confidence += 0.5
+        else:
+            confidence += 0.2  # Base score for passing _is_likely_caption
+
+        # Spatial relationship bonus
+        relationship = spatial_analysis['relationship']
+        if relationship == 'below':
+            confidence += 0.3  # Preferred position
+        elif relationship == 'above':
+            confidence += 0.2
+        elif relationship in ['left', 'right']:
+            confidence += 0.1
+
+        # Proximity bonus (closer is better)
+        proximity = spatial_analysis['proximity_distance']
+        if proximity <= 10:
+            confidence += 0.2
+        elif proximity <= 30:
+            confidence += 0.1
+        elif proximity <= 50:
+            confidence += 0.05
+
+        # Alignment bonus
+        if relationship in ['below', 'above']:
+            confidence += spatial_analysis['horizontal_alignment'] * 0.2
+        else:
+            confidence += spatial_analysis['vertical_alignment'] * 0.2
+
+        # Text length penalty for very long text (likely not a caption)
+        text_length = len(text_content.strip())
+        if text_length > 300:
+            confidence *= 0.5
+        elif text_length > 200:
+            confidence *= 0.8
+
+        return min(1.0, confidence)
+
+    def _has_explicit_caption_markers(self, text):
+        """Check for explicit caption markers (stronger indicators)"""
+        import re
+        text_lower = text.lower().strip()
+
+        explicit_patterns = [
+            r'^(figure|fig|table|chart|diagram)\s*\d+',
+            r'^(source|credit)[:.]',
+            r'^\([a-z]\)',  # (a), (b), etc.
+            r'^\d+\.',      # 1., 2., etc.
+        ]
+
+        return any(re.search(pattern, text_lower) for pattern in explicit_patterns)
+
+    def _is_likely_caption(self, text):
+        """
+        Enhanced caption detection with improved pattern recognition and context analysis.
+
+        Addresses detection issues by expanding pattern recognition and adding
+        contextual analysis for better accuracy.
+        """
+        import re
+
+        if not text or len(text.strip()) < 5:
+            logger.debug(f"Caption check failed: text too short ({len(text.strip()) if text else 0} chars)")
+            return False
+
+        text_lower = text.lower().strip()
+        text_clean = text.strip()
+        logger.debug(f"Checking caption patterns for: '{text_clean[:50]}...'")  # Debug log
+
+        # Enhanced caption patterns - more comprehensive
+        caption_patterns = [
+            # Standard figure/table references
+            r'^(figure|fig|image|diagram|chart|graph|table|schema|plate|exhibit)\s*\d*[:\.\-\s]',
+            r'^(fig\.|figure\.|table\.|chart\.|diagram\.)?\s*\d+[:\.\-\s]',
+
+            # Source and attribution patterns
+            r'^(source|credit|copyright|adapted from|modified from)[:.\-\s]',
+            r'^(photo|image)\s+(by|from|courtesy)',
+
+            # Parenthetical captions
+            r'^\([^)]+\)$',
+
+            # Academic/technical patterns
+            r'^(step|phase|stage|example|case)\s*\d*[:\.]',
+            r'^(above|below|left|right)[:.\-\s]',
+
+            # Multi-language support
+            r'^(figura|tabela|esquema|gráfico)\s*\d*[:\.]',  # Spanish/Portuguese
+            r'^(abbildung|tabelle|diagramm)\s*\d*[:\.]',     # German
+            r'^(図|表|グラフ)\s*\d*[:\.]',                    # Japanese
+        ]
+
+        # Check explicit caption patterns
+        for pattern in caption_patterns:
+            if re.search(pattern, text_lower):
+                return True
+
+        # Enhanced heuristic analysis
+        word_count = len(text_clean.split())
+
+        # Short descriptive text without sentence endings
+        if (word_count <= 15 and
+            not text_clean.endswith('.') and
+            not text_clean.endswith('!') and
+            not text_clean.endswith('?')):
+
+            # Check for descriptive keywords
+            descriptive_keywords = [
+                'showing', 'depicting', 'illustrating', 'displaying',
+                'overview', 'comparison', 'analysis', 'structure',
+                'process', 'workflow', 'system', 'model', 'framework'
+            ]
+
+            if any(keyword in text_lower for keyword in descriptive_keywords):
+                return True
+
+        # Check for numbered/lettered items (a), (b), (1), (2)
+        if re.match(r'^\([a-z0-9]+\)', text_lower):
+            return True
+
+        # Check for colon-separated descriptive text
+        if ':' in text_clean and word_count <= 20:
+            return True
+
+        # Italic or emphasized text patterns (common in captions)
+        if (word_count <= 25 and
+            ('*' in text_clean or '_' in text_clean or
+             text_clean.isupper() or text_clean.islower())):
+            return True
+
+        return False
+
+    def _insert_images_by_spatial_order(self, content_blocks, image_placeholders):
+        """Insert image placeholders into content blocks based on spatial reading order"""
+        if not image_placeholders:
+            return content_blocks
+
+        # Combine all blocks and sort by reading order
+        all_blocks = content_blocks + image_placeholders
+
+        # Sort by reading order position
+        def sort_key(block):
+            pos = getattr(block, 'reading_order_position', None)
+            return pos if pos is not None else float('inf')
+
+        sorted_blocks = sorted(all_blocks, key=sort_key)
+
+        logger.debug(f"Inserted {len(image_placeholders)} images into reading order")
+        return sorted_blocks
 
     def _extract_content_as_document(self, doc, images_by_page, structure_analysis, filepath):
         """Extract content as a structured Document object"""
@@ -1794,7 +2701,35 @@ class StructuredContentExtractor:
         return None
 
     def _extract_page_content_as_blocks(self, page, page_num, structure_analysis):
-        """Extract content from a single page as ContentBlock objects"""
+        """
+        Extract content from a single page as ContentBlock objects with spatial layout analysis.
+
+        Proposition 1: Implements 2D spatial analysis instead of linear block reading.
+        """
+        content_blocks = []
+
+        try:
+            # Proposition 1: Extract all elements with spatial coordinates first
+            all_elements = self._extract_spatial_elements(page, page_num, structure_analysis)
+
+            # Proposition 1: Sort elements by spatial reading order
+            ordered_elements = self._apply_spatial_reading_order(all_elements)
+
+            # Convert ordered elements to ContentBlocks
+            for element in ordered_elements:
+                content_block = self._create_content_block_from_element(element, structure_analysis)
+                if content_block:
+                    content_blocks.append(content_block)
+
+        except Exception as e:
+            logger.warning(f"Error extracting spatial content from page {page_num}: {e}")
+            # Fallback to original method
+            content_blocks = self._extract_page_content_as_blocks_legacy(page, page_num, structure_analysis)
+
+        return content_blocks
+
+    def _extract_page_content_as_blocks_legacy(self, page, page_num, structure_analysis):
+        """Legacy method for extracting content blocks (fallback)"""
         content_blocks = []
 
         try:

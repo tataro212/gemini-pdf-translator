@@ -137,31 +137,10 @@ class MarkdownAwareTranslator:
 
             logger.info(f"📝 Found {len(text_nodes)} text nodes to translate")
 
-            # Translate all text nodes
-            translated_nodes = {}
-            for i, node in enumerate(text_nodes):
-                try:
-                    # Add context from surrounding nodes
-                    node_context_before = context_before
-                    node_context_after = context_after
-
-                    if i > 0:
-                        node_context_before = text_nodes[i-1].content[-100:]
-                    if i < len(text_nodes) - 1:
-                        node_context_after = text_nodes[i+1].content[:100]
-
-                    # Translate only the text content
-                    translated_text = await translation_func(
-                        node.content, target_language, "",
-                        node_context_before, node_context_after, "text_only"
-                    )
-
-                    translated_nodes[node.node_path] = translated_text.strip()
-                    logger.debug(f"Translated node {i+1}/{len(text_nodes)}: '{node.content[:30]}...' -> '{translated_text[:30]}...'")
-
-                except Exception as e:
-                    logger.warning(f"Translation failed for node {i}: {e}")
-                    translated_nodes[node.node_path] = node.content
+            # Translate all text nodes using parallel processing
+            translated_nodes = await self._translate_nodes_parallel(
+                text_nodes, translation_func, target_language, context_before, context_after
+            )
 
             # Reconstruct Markdown with translated text
             result = self._reconstruct_markdown_with_structure(tokens, translated_nodes)
@@ -172,6 +151,118 @@ class MarkdownAwareTranslator:
         except Exception as e:
             logger.error(f"Parse-and-translate method failed: {e}")
             raise
+
+    async def _translate_nodes_parallel(self, text_nodes: List, translation_func,
+                                      target_language: str, context_before: str,
+                                      context_after: str) -> Dict[str, str]:
+        """
+        Translate text nodes in parallel batches with proper ordering and error handling.
+        """
+        import asyncio
+        try:
+            from tqdm.asyncio import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+
+        # Create translation tasks with proper context
+        tasks = []
+        for i, node in enumerate(text_nodes):
+            # Add context from surrounding nodes
+            node_context_before = context_before
+            node_context_after = context_after
+
+            if i > 0:
+                node_context_before = text_nodes[i-1].content[-100:]
+            if i < len(text_nodes) - 1:
+                node_context_after = text_nodes[i+1].content[:100]
+
+            task = self._translate_single_node(
+                node, translation_func, target_language,
+                node_context_before, node_context_after, i
+            )
+            tasks.append(task)
+
+        # Execute translations in parallel with progress bar
+        logger.info(f"🚀 Starting parallel translation of {len(tasks)} nodes...")
+
+        # Use semaphore to limit concurrent requests (avoid rate limiting)
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent translations
+
+        async def translate_with_semaphore(task):
+            async with semaphore:
+                return await task
+
+        # Execute with progress tracking
+        results = []
+        if TQDM_AVAILABLE and len(tasks) > 5:  # Show progress bar for batches > 5
+            logger.info(f"📊 Progress tracking enabled for {len(tasks)} markdown nodes")
+            results = await tqdm.gather(*[translate_with_semaphore(task) for task in tasks],
+                                      desc="🔄 Translating markdown",
+                                      unit="node",
+                                      colour="blue")
+        else:
+            logger.info(f"📊 Processing {len(tasks)} markdown translation tasks...")
+            results = await asyncio.gather(*[translate_with_semaphore(task) for task in tasks],
+                                         return_exceptions=True)
+
+            # Manual progress logging for smaller batches
+            for i in range(0, len(tasks), max(1, len(tasks) // 10)):
+                progress = (i / len(tasks)) * 100
+                logger.info(f"📊 Markdown translation progress: {progress:.1f}% ({i}/{len(tasks)} nodes)")
+
+        # Process results and maintain order
+        translated_nodes = {}
+        successful_translations = 0
+        failed_translations = 0
+
+        for i, result in enumerate(results):
+            node = text_nodes[i]
+            if isinstance(result, Exception):
+                # Enhanced error logging with more details
+                error_details = {
+                    'node_index': i,
+                    'node_path': node.node_path,
+                    'content_preview': node.content[:50] + "..." if len(node.content) > 50 else node.content,
+                    'error_type': type(result).__name__,
+                    'error_message': str(result)
+                }
+                logger.warning(f"Translation failed for node {i}: {error_details['error_type']}: {error_details['error_message']}")
+                logger.warning(f"  Node path: {error_details['node_path']}")
+                logger.warning(f"  Content preview: {error_details['content_preview']}")
+                translated_nodes[node.node_path] = node.content
+                failed_translations += 1
+            else:
+                translated_nodes[node.node_path] = result.strip()
+                successful_translations += 1
+
+        logger.info(f"✅ Parallel translation completed: {successful_translations} successful, {failed_translations} failed")
+        return translated_nodes
+
+    async def _translate_single_node(self, node, translation_func, target_language: str,
+                                   context_before: str, context_after: str, node_index: int) -> str:
+        """
+        Translate a single node with enhanced error handling and retry logic.
+        """
+        import asyncio
+        max_retries = 2
+        retry_delay = 1.0
+
+        for attempt in range(max_retries + 1):
+            try:
+                translated_text = await translation_func(
+                    node.content, target_language, "",
+                    context_before, context_after, "text_only"
+                )
+                return translated_text
+
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.debug(f"Translation attempt {attempt + 1} failed for node {node_index}, retrying: {str(e)}")
+                    await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error(f"All translation attempts failed for node {node_index}: {str(e)}")
+                    raise e
 
     def _extract_translatable_text_nodes(self, tokens: List) -> List[TextNode]:
         """
@@ -317,29 +408,10 @@ class MarkdownAwareTranslator:
                 logger.warning("No text nodes found for translation")
                 return markdown_text
             
-            # Translate all text nodes
-            translated_nodes = {}
-            for i, node in enumerate(text_nodes):
-                try:
-                    # Add context from surrounding nodes
-                    node_context_before = context_before
-                    node_context_after = context_after
-                    
-                    if i > 0:
-                        node_context_before = text_nodes[i-1].content[-100:]
-                    if i < len(text_nodes) - 1:
-                        node_context_after = text_nodes[i+1].content[:100]
-                    
-                    translated_text = await translation_func(
-                        node.content, target_language, "",
-                        node_context_before, node_context_after, "markdown_text"
-                    )
-                    
-                    translated_nodes[node.node_path] = translated_text.strip()
-                    
-                except Exception as e:
-                    logger.warning(f"Translation failed for node {i}: {e}")
-                    translated_nodes[node.node_path] = node.content
+            # Translate all text nodes using parallel processing
+            translated_nodes = await self._translate_nodes_parallel(
+                text_nodes, translation_func, target_language, context_before, context_after
+            )
             
             # Reconstruct Markdown with translated text
             return self._reconstruct_markdown(tokens, translated_nodes)

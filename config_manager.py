@@ -270,4 +270,10 @@ class ConfigManager:
         return issues, recommendations
 
 # Global configuration instance
-config_manager = ConfigManager()
+try:
+    config_manager = ConfigManager()
+except Exception as e:
+    print(f"Error creating global config_manager: {e}")
+    import traceback
+    traceback.print_exc()
+    raise

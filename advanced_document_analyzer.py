@@ -481,7 +481,8 @@ class AdvancedDocumentAnalyzer:
                 'producer': metadata.get('producer', ''),
                 'creation_date': metadata.get('creationDate', ''),
                 'modification_date': metadata.get('modDate', ''),
-                'page_count': len(doc)
+                'page_count': len(doc),
+                'total_pages': len(doc)  # Add for compatibility
             }
         except Exception as e:
             logger.warning(f"Failed to extract metadata: {e}")

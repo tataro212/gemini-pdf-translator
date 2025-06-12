@@ -99,7 +99,18 @@ class HybridOCRProcessor:
         # Check EasyOCR (only if enabled in config)
         enable_easyocr = True
         if self.config_manager:
-            enable_easyocr = self.config_manager.get_config_value('TranslationEnhancements', 'enable_easyocr', False, bool)
+            try:
+                # Try unified config first
+                if hasattr(self.config_manager, 'get_value'):
+                    enable_easyocr = self.config_manager.get_value('translation_enhancements', 'enable_easyocr', False)
+                # Fall back to legacy config manager
+                elif hasattr(self.config_manager, 'get_config_value'):
+                    enable_easyocr = self.config_manager.get_config_value('TranslationEnhancements', 'enable_easyocr', False, bool)
+                else:
+                    enable_easyocr = False
+            except Exception as e:
+                logger.warning(f"Could not get EasyOCR config: {e}, defaulting to False")
+                enable_easyocr = False
 
         if enable_easyocr:
             try:

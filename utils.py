@@ -314,7 +314,28 @@ def estimate_translation_cost(filepath, config_manager):
         estimated_total_chars = (total_chars / min(5, doc_length)) * doc_length
 
         # Get optimization settings
-        opt_settings = config_manager.optimization_settings
+        try:
+            # Try unified config first
+            if hasattr(config_manager, 'get_value'):
+                opt_settings = {
+                    'enable_smart_grouping': config_manager.get_value('api_optimization', 'enable_smart_grouping', True),
+                    'max_group_size_chars': config_manager.get_value('api_optimization', 'max_group_size_chars', 12000)
+                }
+            # Fall back to legacy config manager
+            elif hasattr(config_manager, 'optimization_settings'):
+                opt_settings = config_manager.optimization_settings
+            else:
+                # Default fallback
+                opt_settings = {
+                    'enable_smart_grouping': True,
+                    'max_group_size_chars': 12000
+                }
+        except Exception as e:
+            logger.warning(f"Could not get optimization settings: {e}, using defaults")
+            opt_settings = {
+                'enable_smart_grouping': True,
+                'max_group_size_chars': 12000
+            }
 
         # Estimate API calls with smart grouping
         if opt_settings['enable_smart_grouping']:
@@ -326,7 +347,18 @@ def estimate_translation_cost(filepath, config_manager):
         # Estimate time (rough: 2-5 seconds per API call)
         estimated_time_minutes = (estimated_api_calls * 3) / 60
 
-        gemini_settings = config_manager.gemini_settings
+        # Get gemini settings
+        try:
+            if hasattr(config_manager, 'get_value'):
+                model_name = config_manager.get_value('gemini', 'model_name', 'models/gemini-1.5-pro')
+                gemini_settings = {'model_name': model_name}
+            elif hasattr(config_manager, 'gemini_settings'):
+                gemini_settings = config_manager.gemini_settings
+            else:
+                gemini_settings = {'model_name': 'models/gemini-1.5-pro'}
+        except Exception as e:
+            logger.warning(f"Could not get gemini settings: {e}, using defaults")
+            gemini_settings = {'model_name': 'models/gemini-1.5-pro'}
 
         logger.info("📊 TRANSLATION ESTIMATE:")
         logger.info(f"  📄 Document pages: {doc_length}")

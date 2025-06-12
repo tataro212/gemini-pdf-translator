@@ -24,6 +24,13 @@ try:
     STRUCTURED_MODEL_AVAILABLE = True
 except ImportError:
     STRUCTURED_MODEL_AVAILABLE = False
+    # Create dummy classes for type checking
+    class Document: pass
+    class Heading: pass
+    class Paragraph: pass
+    class ListItem: pass
+    class Footnote: pass
+    class Caption: pass
     logger.warning("Structured document model not available")
 
 # Import markdown translator (with fallback if not available)
@@ -459,7 +466,20 @@ class TranslationService:
             return translation
 
         except Exception as e:
-            logger.error(f"Translation failed for text: {text[:100]}... Error: {e}")
+            # Enhanced error logging with more details
+            error_details = {
+                'error_type': type(e).__name__,
+                'error_message': str(e),
+                'text_length': len(text),
+                'text_preview': text[:100] + "..." if len(text) > 100 else text,
+                'target_language': target_language,
+                'model_name': self.gemini_settings['model_name']
+            }
+
+            logger.error(f"Translation failed: {error_details['error_type']}: {error_details['error_message']}")
+            logger.error(f"  Text preview: {error_details['text_preview']}")
+            logger.error(f"  Target language: {error_details['target_language']}")
+            logger.error(f"  Model: {error_details['model_name']}")
             raise
 
     async def translate_document(self, document, target_language=None, style_guide=""):
@@ -486,49 +506,10 @@ class TranslationService:
 
         logger.info(f"📝 Translating {len(translatable_blocks)} blocks, preserving {len(non_translatable_blocks)} blocks")
 
-        # Translate only the translatable blocks
-        translated_blocks = []
-        for i, block in enumerate(translatable_blocks):
-            try:
-                logger.debug(f"Translating block {i+1}/{len(translatable_blocks)}: {type(block).__name__}")
-
-                # Get content to translate based on block type
-                if isinstance(block, Heading):
-                    content_to_translate = block.content
-                elif isinstance(block, Paragraph):
-                    content_to_translate = block.content
-                elif isinstance(block, ListItem):
-                    content_to_translate = block.content
-                elif isinstance(block, Footnote):
-                    content_to_translate = block.content
-                elif isinstance(block, Caption):
-                    content_to_translate = block.content
-                else:
-                    # Fallback to original_text
-                    content_to_translate = block.original_text
-
-                # Skip empty content
-                if not content_to_translate or not content_to_translate.strip():
-                    logger.debug(f"Skipping empty content block: {type(block).__name__}")
-                    translated_blocks.append(block)
-                    continue
-
-                # Translate the content with improved prompt structure
-                translated_content = await self._translate_content_block(
-                    content_to_translate,
-                    target_language,
-                    style_guide,
-                    type(block).__name__.lower()
-                )
-
-                # Create new block with translated content
-                translated_block = self._create_translated_block(block, translated_content)
-                translated_blocks.append(translated_block)
-
-            except Exception as e:
-                logger.error(f"Failed to translate block {i+1}: {e}")
-                # Keep original block on translation failure
-                translated_blocks.append(block)
+        # Translate blocks in parallel for much faster processing
+        translated_blocks = await self._translate_blocks_parallel(
+            translatable_blocks, target_language, style_guide
+        )
 
         # Create new Document with translated content blocks
         # Merge translated and non-translatable blocks in original order
@@ -565,6 +546,120 @@ class TranslationService:
 
         logger.info(f"✅ Document translation completed: {len(translated_blocks)} blocks translated")
         return translated_document
+
+    async def _translate_blocks_parallel(self, translatable_blocks, target_language, style_guide):
+        """
+        Translate content blocks in parallel for much faster processing.
+        """
+        import asyncio
+        try:
+            from tqdm.asyncio import tqdm
+            TQDM_AVAILABLE = True
+        except ImportError:
+            TQDM_AVAILABLE = False
+
+        logger.info(f"🚀 Starting parallel translation of {len(translatable_blocks)} blocks...")
+
+        # Create translation tasks
+        tasks = []
+        for i, block in enumerate(translatable_blocks):
+            task = self._translate_single_block(block, target_language, style_guide, i)
+            tasks.append(task)
+
+        # Use semaphore to limit concurrent requests (avoid rate limiting)
+        semaphore = asyncio.Semaphore(5)  # Max 5 concurrent translations
+
+        async def translate_with_semaphore(task):
+            async with semaphore:
+                return await task
+
+        # Execute with progress tracking
+        results = []
+        if TQDM_AVAILABLE and len(tasks) > 5:  # Show progress bar for batches > 5
+            logger.info(f"📊 Progress tracking enabled for {len(tasks)} translation tasks")
+            results = await tqdm.gather(*[translate_with_semaphore(task) for task in tasks],
+                                      desc="🌐 Translating blocks",
+                                      unit="block",
+                                      colour="green")
+        else:
+            logger.info(f"📊 Processing {len(tasks)} translation tasks...")
+            results = await asyncio.gather(*[translate_with_semaphore(task) for task in tasks],
+                                         return_exceptions=True)
+
+            # Manual progress logging for smaller batches
+            for i in range(0, len(tasks), max(1, len(tasks) // 10)):
+                progress = (i / len(tasks)) * 100
+                logger.info(f"📊 Translation progress: {progress:.1f}% ({i}/{len(tasks)} blocks)")
+
+        # Process results and maintain order
+        translated_blocks = []
+        successful_translations = 0
+        failed_translations = 0
+
+        for i, result in enumerate(results):
+            original_block = translatable_blocks[i]
+            if isinstance(result, Exception):
+                logger.warning(f"Translation failed for block {i+1}: {str(result)}")
+                translated_blocks.append(original_block)  # Keep original on failure
+                failed_translations += 1
+            else:
+                translated_blocks.append(result)
+                successful_translations += 1
+
+        logger.info(f"✅ Parallel translation completed: {successful_translations} successful, {failed_translations} failed")
+        return translated_blocks
+
+    async def _translate_single_block(self, block, target_language, style_guide, block_index):
+        """
+        Translate a single content block with enhanced error handling and retry logic.
+        """
+        import asyncio
+        max_retries = 2
+        retry_delay = 1.0
+
+        for attempt in range(max_retries + 1):
+            try:
+                logger.debug(f"Translating block {block_index+1}: {type(block).__name__}")
+
+                # Get content to translate based on block type
+                if isinstance(block, Heading):
+                    content_to_translate = block.content
+                elif isinstance(block, Paragraph):
+                    content_to_translate = block.content
+                elif isinstance(block, ListItem):
+                    content_to_translate = block.content
+                elif isinstance(block, Footnote):
+                    content_to_translate = block.content
+                elif isinstance(block, Caption):
+                    content_to_translate = block.content
+                else:
+                    # Fallback to original_text
+                    content_to_translate = block.original_text
+
+                # Skip empty content
+                if not content_to_translate or not content_to_translate.strip():
+                    logger.debug(f"Skipping empty content block: {type(block).__name__}")
+                    return block
+
+                # Translate the content with improved prompt structure
+                translated_content = await self._translate_content_block(
+                    content_to_translate,
+                    target_language,
+                    style_guide,
+                    type(block).__name__.lower()
+                )
+
+                # Create new block with translated content
+                translated_block = self._create_translated_block(block, translated_content)
+                return translated_block
+
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.debug(f"Translation attempt {attempt + 1} failed for block {block_index+1}, retrying: {str(e)}")
+                    await asyncio.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error(f"All translation attempts failed for block {block_index+1}: {str(e)}")
+                    raise e
 
     async def _translate_content_block(self, content, target_language, style_guide, block_type):
         """Translate content with improved prompt structure to prevent leakage"""

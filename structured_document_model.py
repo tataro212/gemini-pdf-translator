@@ -36,9 +36,15 @@ class ContentBlock:
     bbox: Tuple[float, float, float, float]  # (x0, y0, x1, y1)
     block_num: Optional[int] = None
     formatting: Optional[Dict[str, Any]] = None
-    
+    block_id: Optional[str] = None  # Unique identifier for the block
+
     def __post_init__(self):
         """Validate the content block after initialization."""
+        # Generate unique block ID if not provided
+        if self.block_id is None:
+            import uuid
+            self.block_id = str(uuid.uuid4())
+
         if not isinstance(self.block_type, ContentType):
             raise ValueError(f"block_type must be a ContentType enum, got {type(self.block_type)}")
         if len(self.bbox) != 4:
@@ -69,14 +75,18 @@ class Paragraph(ContentBlock):
 
 @dataclass
 class ImagePlaceholder(ContentBlock):
-    """Represents an image placeholder with metadata."""
+    """Represents an image placeholder with metadata and spatial relationships."""
     image_path: str = ""
     caption: str = ""
     width: Optional[int] = None
     height: Optional[int] = None
     ocr_text: Optional[str] = None
     translation_needed: bool = False
-    
+    # Spatial layout enhancements
+    caption_block_id: Optional[str] = None  # ID of associated caption block
+    spatial_relationship: Optional[str] = None  # "before", "after", "alongside", "wrapped"
+    reading_order_position: Optional[int] = None  # Position in spatial reading order
+
     def __post_init__(self):
         super().__post_init__()
         # For images, original_text might be empty or contain OCR text
@@ -143,10 +153,12 @@ class Equation(ContentBlock):
 
 @dataclass
 class Caption(ContentBlock):
-    """Represents a caption for figures, tables, etc."""
+    """Represents a caption for figures, tables, etc. with formal linking support."""
     content: str = ""
     target_type: Optional[str] = None  # "figure", "table", etc.
-    
+    target_block_id: Optional[str] = None  # ID of the associated content block
+    spatial_proximity: Optional[float] = None  # Distance to target block
+
     def __post_init__(self):
         super().__post_init__()
         if not self.content and self.original_text:

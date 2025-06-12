@@ -210,3 +210,43 @@ Thumbs.db
 
 # Log files
 *.log
+
+# Backup directory (for cleanup backups)
+backups/
+
+# Semantic cache directories (regenerated as needed)
+*semantic_cache/
+demo_semantic_cache/
+test_semantic_cache/
+advanced_semantic_cache/
+
+# Temporary processing directories
+nougat_temp/
+*_temp/
+*_output/
+*_results/
+
+# Cache files
+translation_cache.json
+
+# Backup directory
+backups/
+
+# Large model files (download when needed)
+*.pt
+*.onnx
+*.weights
+
+# Miniconda installer
+Miniconda3-latest-Windows-x86_64.exe
+
+# Semantic cache directories
+*semantic_cache/
+demo_semantic_cache/
+test_semantic_cache/
+advanced_semantic_cache/
+
+# Archive files
+*.zip
+*.tar.gz
+*.rar

@@ -40,6 +40,27 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# Simple wrapper class to make dictionary results compatible with main workflow
+class IntelligentTranslationResult:
+    """Wrapper class to make intelligent translation results compatible with main workflow"""
+    def __init__(self, result_dict: Dict[str, Any]):
+        self.result_dict = result_dict
+        self.success = result_dict.get('success', False)
+        self.error = result_dict.get('error', '')
+
+        # Create a mock processed_document for compatibility
+        if self.success:
+            # For now, create a simple mock document
+            # In the future, this should be the actual translated structured document
+            from structured_document_model import Document
+            self.processed_document = Document(
+                title="Translated Document",
+                content_blocks=[],
+                metadata={'intelligent_translation': True}
+            )
+        else:
+            self.processed_document = None
+
 @dataclass
 class ProcessingResult:
     """Result of processing a single page or content item"""
@@ -118,12 +139,14 @@ class IntelligentPDFTranslator:
             final_result = await self._assemble_final_result(
                 processing_result, output_dir, start_time
             )
-            
-            return final_result
+
+            # Wrap result for compatibility with main workflow
+            return IntelligentTranslationResult(final_result)
             
         except Exception as e:
             logger.error(f"❌ Intelligent translation failed: {e}")
-            return self._create_error_result(f"Translation failed: {e}", start_time)
+            error_result = self._create_error_result(f"Translation failed: {e}", start_time)
+            return IntelligentTranslationResult(error_result)
     
     async def _analyze_document_intelligently(self, pdf_path: str) -> Dict[str, Any]:
         """Phase 1: Perform intelligent document analysis"""
@@ -155,16 +178,24 @@ class IntelligentPDFTranslator:
             logger.error(f"Document analysis failed: {e}")
             return {'success': False, 'error': str(e)}
     
-    async def _preprocess_content_intelligently(self, pdf_path: str, analysis: Dict, 
+    async def _preprocess_content_intelligently(self, pdf_path: str, analysis: Dict,
                                               output_dir: str) -> Dict[str, Any]:
         """Phase 2: Intelligent content preprocessing with cost optimization"""
         try:
             # Extract images with intelligent filtering
             image_output_dir = os.path.join(output_dir, "extracted_images")
             os.makedirs(image_output_dir, exist_ok=True)
-            
+
             # Extract all images first
             all_images = self.pdf_parser.extract_images_from_pdf(pdf_path, image_output_dir)
+
+            # Handle case where analysis is a string instead of dict
+            if isinstance(analysis, str):
+                logger.warning(f"Analysis is string instead of dict: {analysis}")
+                analysis = {'error': analysis}
+            elif not isinstance(analysis, dict):
+                logger.warning(f"Analysis is not dict: {type(analysis)}")
+                analysis = {'error': 'Invalid analysis format'}
             
             # Apply intelligent image filtering
             if all_images:
@@ -236,28 +267,41 @@ class IntelligentPDFTranslator:
             # Process each group with appropriate tool
             processed_results = {}
             
+            # USER REQUIREMENT: Add progress tracking for translation batches
+            total_batches = len([items for items in routing_groups.values() if items])
+            completed_batches = 0
+
+            logger.info(f"📊 Starting translation of {total_batches} batches...")
+            self._print_progress_bar(0, total_batches, "Translation Progress")
+
             # Process in parallel using ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 # Submit processing tasks
                 future_to_tool = {}
-                
+
                 for tool, items in routing_groups.items():
                     if items:  # Only process non-empty groups
+                        logger.info(f"📤 Submitting batch: {tool} ({len(items)} items)")
                         future = executor.submit(
                             self._process_content_group, tool, items, target_language
                         )
                         future_to_tool[future] = tool
-                
-                # Collect results as they complete
+
+                # Collect results as they complete with progress tracking
                 for future in as_completed(future_to_tool):
                     tool = future_to_tool[future]
+                    completed_batches += 1
+                    progress_percent = (completed_batches / total_batches) * 100
+
                     try:
                         result = future.result()
                         processed_results[tool] = result
-                        logger.info(f"✅ {tool} processing complete: {result.get('items_processed', 0)} items")
+                        logger.info(f"✅ [{completed_batches}/{total_batches}] ({progress_percent:.1f}%) {tool} processing complete: {result.get('items_processed', 0)} items")
+                        self._print_progress_bar(completed_batches, total_batches, f"Translation Progress - {tool}")
                     except Exception as e:
-                        logger.error(f"❌ {tool} processing failed: {e}")
+                        logger.error(f"❌ [{completed_batches}/{total_batches}] ({progress_percent:.1f}%) {tool} processing failed: {e}")
                         processed_results[tool] = {'success': False, 'error': str(e)}
+                        self._print_progress_bar(completed_batches, total_batches, f"Translation Progress - {tool} (FAILED)")
             
             # Combine all processed content
             all_processed_items = []
@@ -304,6 +348,15 @@ class IntelligentPDFTranslator:
         for item in content_items:
             page_num = item.get('page_num', 1)
             page_profile = page_profile_map.get(page_num)
+
+            # USER REQUIREMENT: Skip translation for images/diagrams/schemes
+            item_type = item.get('type', '')
+            if item_type in ['image', 'diagram', 'scheme', 'figure', 'chart', 'graph']:
+                logger.info(f"🚫 Skipping translation for visual content: {item_type}")
+                item['routing_decision'] = ProcessingTool.SKIP.value
+                item['skip_reason'] = 'visual_content_bypass'
+                routing_groups[ProcessingTool.SKIP.value].append(item)
+                continue
 
             # Use strategy manager for intelligent routing
             routing_decision = self.strategy_manager.route_content_intelligently(item, page_profile)
@@ -514,6 +567,23 @@ class IntelligentPDFTranslator:
             json.dump(report_data, f, indent=2, ensure_ascii=False)
 
         logger.info(f"📊 Processing report saved: {report_path}")
+
+    def _print_progress_bar(self, current: int, total: int, description: str = "Progress"):
+        """Print a simple progress bar for translation batches"""
+        if total == 0:
+            return
+
+        progress = current / total
+        bar_length = 40
+        filled_length = int(bar_length * progress)
+
+        bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        percent = progress * 100
+
+        print(f"\r{description}: |{bar}| {current}/{total} ({percent:.1f}%)", end='', flush=True)
+
+        if current == total:
+            print()  # New line when complete
 
     def _create_error_result(self, error_message: str, start_time: float) -> Dict[str, Any]:
         """Create standardized error result"""

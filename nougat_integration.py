@@ -11,10 +11,133 @@ import logging
 import subprocess
 import json
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+def _process_nougat_batch_worker(task):
+    """
+    Worker function for parallel batch processing.
+    Must be at module level to be pickable by ProcessPoolExecutor.
+
+    CRITICAL FIX: Avoid conda environment conflicts by using process isolation
+    """
+    try:
+        import subprocess
+        import os
+        import tempfile
+        import time
+        import warnings
+        from pathlib import Path
+
+        # Suppress PyTorch warnings that cause Nougat to fail
+        warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+        warnings.filterwarnings("ignore", message=".*torch.meshgrid.*")
+
+        # Extract task parameters
+        pdf_path = task['pdf_path']
+        output_dir = task['output_dir']
+        start_page = task['start_page']
+        end_page = task['end_page']
+        batch_num = task['batch_num']
+
+        # Create process-specific temp directory to avoid file conflicts
+        process_id = os.getpid()
+        timestamp = int(time.time() * 1000)  # milliseconds for uniqueness
+        unique_suffix = f"batch_{batch_num}_pid_{process_id}_{timestamp}"
+
+        # Create batch-specific output directory with unique naming
+        batch_output_dir = os.path.join(output_dir, unique_suffix)
+        os.makedirs(batch_output_dir, exist_ok=True)
+
+        # Use direct nougat executable path to avoid conda activation conflicts
+        nougat_exe = NOUGAT_EXECUTABLE_PATH
+
+        # Set process-specific environment variables to avoid conda conflicts
+        env = os.environ.copy()
+        env['CONDA_DEFAULT_ENV'] = 'nougat_env'
+        env['CONDA_PREFIX'] = r'C:\Users\30694\Miniconda3\envs\nougat_env'
+        env['TMPDIR'] = batch_output_dir  # Use our own temp directory
+        env['TEMP'] = batch_output_dir
+        env['TMP'] = batch_output_dir
+
+        # Suppress PyTorch warnings that cause Nougat to fail
+        env['PYTHONWARNINGS'] = 'ignore::UserWarning:torch'
+        env['PYTORCH_DISABLE_WARNINGS'] = '1'
+
+        # Build command with direct executable (no conda activation)
+        cmd = [
+            nougat_exe,
+            pdf_path,
+            '-o', batch_output_dir,
+            '--markdown',
+            '--batchsize', '1',
+            '--pages', f"{start_page+1}-{end_page}"
+        ]
+
+        # Shorter timeout for batches
+        timeout_seconds = min(300, (end_page - start_page) * 10)
+
+        # Run command with isolated environment
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout_seconds, env=env)
+
+        # Check for actual errors vs PyTorch warnings
+        if result.returncode != 0:
+            stderr_lower = result.stderr.lower()
+            # If it's just PyTorch warnings, don't treat as failure
+            if ('userwarning' in stderr_lower and 'torch.meshgrid' in stderr_lower and
+                'error' not in stderr_lower and 'exception' not in stderr_lower):
+                print(f"Worker batch {batch_num}: PyTorch warnings detected but continuing...")
+            else:
+                # Real error occurred
+                print(f"Worker batch {batch_num} failed: {result.stderr}")
+                return None
+
+        # Find and parse output file
+        pdf_name = Path(pdf_path).stem
+        output_file = os.path.join(batch_output_dir, f"{pdf_name}.mmd")
+
+        if not os.path.exists(output_file):
+            print(f"Worker batch {batch_num} output file not found: {output_file}")
+            return None
+
+        with open(output_file, 'r', encoding='utf-8') as f:
+            batch_content = f.read()
+
+        # Simple structure analysis (avoid complex object creation in worker)
+        structure = {
+            'headings': [],
+            'first_line': batch_content.split('\n')[0].strip() if batch_content else '',
+            'last_line': batch_content.split('\n')[-1].strip() if batch_content else '',
+            'starts_with_heading': batch_content.strip().startswith('#') if batch_content else False,
+            'ends_with_incomplete': False
+        }
+
+        # Cleanup: Remove the temporary batch directory to avoid accumulation
+        try:
+            import shutil
+            shutil.rmtree(batch_output_dir)
+        except Exception as cleanup_error:
+            print(f"Warning: Could not cleanup batch directory {batch_output_dir}: {cleanup_error}")
+
+        return {
+            'batch_num': batch_num,
+            'start_page': start_page,
+            'end_page': end_page,
+            'content': batch_content,
+            'page_count': end_page - start_page,
+            'structure': structure
+        }
+
+    except subprocess.TimeoutExpired:
+        print(f"Worker batch {batch_num} timed out after {timeout_seconds} seconds")
+        return None
+    except Exception as e:
+        print(f"Worker process error for batch {task.get('batch_num', 'unknown')}: {e}")
+        return None
 
 # Define the full path to the Nougat executable in the dedicated environment
 NOUGAT_EXECUTABLE_PATH = r"C:\Users\30694\Miniconda3\envs\nougat_env\Scripts\nougat.exe"
@@ -223,9 +346,18 @@ class NougatIntegration:
         self.temp_dir = "nougat_temp"
         self.use_alternative = False
 
+        # Dead letter queue for failed pages/batches
+        self.failed_pages = {}  # {pdf_path: {page_num: failure_count}}
+        self.quarantine_dir = os.path.join(self.temp_dir, "quarantine")
+        os.makedirs(self.quarantine_dir, exist_ok=True)
+        self.max_retries = 3  # Maximum retries before quarantine
+
         # Try to load alternative if Nougat not available
         if not self.nougat_available:
             self.use_alternative = self._try_load_alternative()
+
+        # Check GPU acceleration
+        self._check_gpu_acceleration()
         
     def _check_nougat_availability(self) -> bool:
         """Check if Nougat is installed and available"""
@@ -291,14 +423,17 @@ class NougatIntegration:
             logger.error(f"❌ Error installing Nougat: {e}")
             return False
     
-    def parse_pdf_with_nougat(self, pdf_path: str, output_dir: str = None) -> Optional[Dict]:
+    def parse_pdf_with_nougat(self, pdf_path: str, output_dir: str = None,
+                             batch_size: int = 50, max_pages: int = None) -> Optional[Dict]:
         """
-        Parse PDF using Nougat and return structured content
-        
+        Parse PDF using Nougat with batch processing for large documents
+
         Args:
             pdf_path: Path to the PDF file
             output_dir: Directory to save Nougat output (optional)
-            
+            batch_size: Number of pages to process per batch (default: 50)
+            max_pages: Maximum pages to process (None for all pages)
+
         Returns:
             Dictionary containing parsed content structure
         """
@@ -307,49 +442,548 @@ class NougatIntegration:
             if not self.install_nougat():
                 logger.error("Cannot proceed without Nougat")
                 return None
-        
+
         if output_dir is None:
             output_dir = self.temp_dir
-            
+
         os.makedirs(output_dir, exist_ok=True)
-        
+
+        # Check document size and determine processing strategy
         try:
-            logger.info(f"🔍 Parsing PDF with Nougat: {os.path.basename(pdf_path)}")
+            import fitz
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            doc.close()
 
-            # Run Nougat on the PDF with patch applied
-            cmd = self._get_nougat_command(pdf_path, output_dir, ['--markdown'])
+            # USER REQUIREMENT: Skip bibliography pages (last 20% of document)
+            if max_pages is None:
+                # Process only first 80% to exclude bibliography
+                max_pages = int(total_pages * 0.8)
+                logger.info(f"📚 Excluding bibliography: processing {max_pages}/{total_pages} pages (80%)")
 
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=600)
-            
+            # Determine if batch processing is needed
+            if max_pages > batch_size:
+                logger.info(f"📄 Large document detected: {max_pages} pages, using batch processing (batch_size={batch_size})")
+                return self._parse_pdf_in_batches(pdf_path, output_dir, batch_size, max_pages)
+            else:
+                logger.info(f"📄 Small document: {max_pages} pages, using single-pass processing")
+                return self._parse_pdf_single_pass(pdf_path, output_dir, max_pages)
+
+        except Exception as e:
+            logger.error(f"Error analyzing document: {e}")
+            return None
+
+    def _parse_pdf_in_batches(self, pdf_path: str, output_dir: str, batch_size: int, max_pages: int) -> Optional[Dict]:
+        """Parse large PDF in batches with optional parallel processing"""
+        logger.info(f"🔄 Starting batch processing: {max_pages} pages in batches of {batch_size}")
+
+        # Check if parallel processing is enabled and beneficial
+        total_batches = (max_pages + batch_size - 1) // batch_size
+        use_parallel = self._should_use_parallel_batching(total_batches)
+
+        if use_parallel:
+            return self._parse_pdf_in_batches_parallel(pdf_path, output_dir, batch_size, max_pages)
+        else:
+            return self._parse_pdf_in_batches_sequential(pdf_path, output_dir, batch_size, max_pages)
+
+    def _check_available_memory(self) -> float:
+        """Check available system memory in GB"""
+        try:
+            import psutil
+            memory = psutil.virtual_memory()
+            available_gb = memory.available / (1024**3)
+            total_gb = memory.total / (1024**3)
+            logger.debug(f"💾 Memory: {available_gb:.1f}GB available / {total_gb:.1f}GB total")
+            return available_gb
+        except ImportError:
+            logger.warning("⚠️ psutil not available - cannot check memory, assuming 8GB")
+            return 8.0  # Conservative assumption
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check memory: {e} - assuming 8GB")
+            return 8.0
+
+    def _should_use_parallel_batching(self, total_batches: int) -> bool:
+        """Determine if parallel batch processing should be used"""
+        # Only use parallel processing for multiple batches
+        if total_batches < 2:
+            return False
+
+        # Check if Nougat executable exists for direct execution
+        if not os.path.exists(NOUGAT_EXECUTABLE_PATH):
+            logger.warning(f"⚠️ Nougat executable not found at {NOUGAT_EXECUTABLE_PATH} - using sequential processing")
+            return False
+
+        # Check available memory - each Nougat instance needs ~3GB
+        available_memory = self._check_available_memory()
+        memory_needed_per_worker = 3.0  # GB
+        max_workers_by_memory = int(available_memory // memory_needed_per_worker)
+
+        if max_workers_by_memory < 2:
+            logger.warning(f"⚠️ Insufficient memory for parallel processing: {available_memory:.1f}GB available, need {memory_needed_per_worker * 2}GB minimum")
+            return False
+
+        # Check if we have enough CPU cores (leave one core free)
+        import multiprocessing
+        available_cores = max(1, multiprocessing.cpu_count() - 1)
+
+        # Use parallel processing if we have multiple cores and multiple batches
+        if available_cores >= 2 and total_batches >= 2:
+            # MEMORY-AWARE: Calculate safe worker count based on memory and cores
+            max_workers_by_cores = available_cores // 4  # Very conservative core usage
+            max_workers = min(max_workers_by_cores, max_workers_by_memory, total_batches, 2)
+
+            if max_workers < 2:
+                logger.info(f"📄 Using sequential batch processing: insufficient resources (cores: {available_cores}, memory: {available_memory:.1f}GB)")
+                return False
+
+            logger.info(f"🚀 Enabling parallel batch processing: {total_batches} batches across {max_workers} workers")
+            logger.info(f"💡 Using direct executable: {NOUGAT_EXECUTABLE_PATH}")
+            logger.info(f"💾 Memory allocation: {max_workers} × {memory_needed_per_worker}GB = {max_workers * memory_needed_per_worker}GB")
+            return True
+        else:
+            logger.info(f"📄 Using sequential batch processing: {total_batches} batches (cores: {available_cores})")
+            return False
+
+    def _parse_pdf_in_batches_sequential(self, pdf_path: str, output_dir: str, batch_size: int, max_pages: int) -> Optional[Dict]:
+        """Parse large PDF in batches sequentially (original implementation)"""
+        all_content = []
+        failed_batches = []
+
+        for start_page in range(0, max_pages, batch_size):
+            end_page = min(start_page + batch_size, max_pages)
+            batch_num = (start_page // batch_size) + 1
+            total_batches = (max_pages + batch_size - 1) // batch_size
+
+            logger.info(f"📦 Processing batch {batch_num}/{total_batches}: pages {start_page+1}-{end_page}")
+
+            try:
+                batch_result = self._parse_pdf_batch(pdf_path, output_dir, start_page, end_page, batch_num)
+                if batch_result:
+                    all_content.append(batch_result)
+                    logger.info(f"✅ Batch {batch_num} completed successfully")
+                else:
+                    # Use dead letter queue logic
+                    can_retry = self._handle_failed_batch(pdf_path, batch_num, start_page, end_page, "Batch processing failed")
+                    if not can_retry:
+                        failed_batches.append(batch_num)
+
+            except Exception as e:
+                # Use dead letter queue logic
+                can_retry = self._handle_failed_batch(pdf_path, batch_num, start_page, end_page, str(e))
+                if not can_retry:
+                    failed_batches.append(batch_num)
+
+        if not all_content:
+            logger.error("❌ All batches failed")
+            return None
+
+        # Combine all batch results
+        logger.info(f"🔗 Combining {len(all_content)} successful batches...")
+        combined_result = self._combine_batch_results(all_content, pdf_path)
+
+        if failed_batches:
+            logger.warning(f"⚠️ {len(failed_batches)} batches failed: {failed_batches}")
+            combined_result['metadata']['failed_batches'] = failed_batches
+
+        return combined_result
+
+    def _parse_pdf_in_batches_parallel(self, pdf_path: str, output_dir: str, batch_size: int, max_pages: int) -> Optional[Dict]:
+        """Parse large PDF in batches using parallel processing with fallback to sequential"""
+        try:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            import multiprocessing
+
+            total_batches = (max_pages + batch_size - 1) // batch_size
+            # MEMORY-AWARE: Severely limit workers to prevent OOM
+            # Each Nougat instance needs ~2-4GB RAM for model loading
+            max_workers = min(max(1, multiprocessing.cpu_count() // 4), total_batches, 2)
+
+            logger.info(f"🚀 Starting parallel batch processing: {total_batches} batches with {max_workers} workers (memory-limited)")
+            logger.warning(f"⚠️ Each worker will use ~3GB RAM - total memory usage: ~{max_workers * 3}GB")
+
+            # Create batch tasks
+            batch_tasks = []
+            for start_page in range(0, max_pages, batch_size):
+                end_page = min(start_page + batch_size, max_pages)
+                batch_num = (start_page // batch_size) + 1
+
+                batch_tasks.append({
+                    'pdf_path': pdf_path,
+                    'output_dir': output_dir,
+                    'start_page': start_page,
+                    'end_page': end_page,
+                    'batch_num': batch_num
+                })
+
+            all_content = []
+            failed_batches = []
+            completed_batches = 0
+
+            # Process batches in parallel
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all batch tasks
+                future_to_batch = {
+                    executor.submit(_process_nougat_batch_worker, task): task['batch_num']
+                    for task in batch_tasks
+                }
+
+                # Collect results as they complete
+                for future in as_completed(future_to_batch):
+                    batch_num = future_to_batch[future]
+                    completed_batches += 1
+                    progress = (completed_batches / total_batches) * 100
+
+                    try:
+                        batch_result = future.result()
+                        if batch_result:
+                            all_content.append(batch_result)
+                            logger.info(f"✅ Batch {batch_num} completed successfully ({progress:.1f}% complete)")
+                        else:
+                            failed_batches.append(batch_num)
+                            logger.warning(f"❌ Batch {batch_num} failed ({progress:.1f}% complete)")
+
+                    except Exception as e:
+                        failed_batches.append(batch_num)
+                        logger.error(f"❌ Batch {batch_num} processing error: {e} ({progress:.1f}% complete)")
+
+            # Check if parallel processing was successful
+            if not all_content:
+                logger.error("❌ All parallel batches failed - falling back to sequential processing")
+                return self._parse_pdf_in_batches_sequential(pdf_path, output_dir, batch_size, max_pages)
+
+            # If too many batches failed, consider fallback
+            failure_rate = len(failed_batches) / total_batches
+            if failure_rate > 0.5:  # More than 50% failed
+                logger.warning(f"⚠️ High failure rate ({failure_rate:.1%}) in parallel processing - consider using sequential mode")
+
+            # Combine all batch results
+            logger.info(f"🔗 Combining {len(all_content)} successful parallel batches...")
+            combined_result = self._combine_batch_results(all_content, pdf_path)
+
+            if failed_batches:
+                logger.warning(f"⚠️ {len(failed_batches)} parallel batches failed: {failed_batches}")
+                combined_result['metadata']['failed_batches'] = failed_batches
+                combined_result['metadata']['parallel_processing'] = True
+
+            return combined_result
+
+        except Exception as e:
+            logger.error(f"❌ Parallel processing failed with error: {e}")
+            logger.info("🔄 Falling back to sequential batch processing...")
+            return self._parse_pdf_in_batches_sequential(pdf_path, output_dir, batch_size, max_pages)
+
+    def _parse_pdf_batch(self, pdf_path: str, output_dir: str, start_page: int, end_page: int, batch_num: int) -> Optional[Dict]:
+        """Parse a specific batch of pages with structure preservation"""
+        try:
+            # Create batch-specific output directory
+            batch_output_dir = os.path.join(output_dir, f"batch_{batch_num}")
+            os.makedirs(batch_output_dir, exist_ok=True)
+
+            # Run Nougat with page range
+            cmd = self._get_nougat_command(pdf_path, batch_output_dir, [
+                '--markdown',
+                '--batchsize', '1',
+                '--pages', f"{start_page+1}-{end_page}"  # Nougat uses 1-based indexing
+            ])
+
+            # Shorter timeout for batches
+            timeout_seconds = min(300, (end_page - start_page) * 10)  # 10 seconds per page, max 5 minutes
+
+            logger.debug(f"🚀 Running batch command: {cmd}")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
+
+            # Check for actual errors vs PyTorch warnings
+            if result.returncode != 0:
+                stderr_lower = result.stderr.lower()
+                # If it's just PyTorch warnings, don't treat as failure
+                if ('userwarning' in stderr_lower and 'torch.meshgrid' in stderr_lower and
+                    'error' not in stderr_lower and 'exception' not in stderr_lower):
+                    logger.info(f"Batch {batch_num}: PyTorch warnings detected but continuing...")
+                else:
+                    # Real error occurred
+                    logger.error(f"Batch {batch_num} failed: {result.stderr}")
+                    return None
+
+            # Find and parse output file
+            pdf_name = Path(pdf_path).stem
+            output_file = os.path.join(batch_output_dir, f"{pdf_name}.mmd")
+
+            if not os.path.exists(output_file):
+                logger.error(f"Batch {batch_num} output file not found: {output_file}")
+                return None
+
+            with open(output_file, 'r', encoding='utf-8') as f:
+                batch_content = f.read()
+
+            # Analyze batch structure for better combination
+            batch_structure = self._analyze_batch_structure(batch_content, start_page, end_page)
+
+            return {
+                'batch_num': batch_num,
+                'start_page': start_page,
+                'end_page': end_page,
+                'content': batch_content,
+                'page_count': end_page - start_page,
+                'structure': batch_structure
+            }
+
+        except subprocess.TimeoutExpired:
+            logger.warning(f"⏰ Batch {batch_num} timed out after {timeout_seconds} seconds")
+            return None
+        except Exception as e:
+            logger.error(f"❌ Batch {batch_num} processing error: {e}")
+            return None
+
+    def _analyze_batch_structure(self, content: str, start_page: int, end_page: int) -> Dict:
+        """Analyze the structure of a batch for better combination"""
+        structure = {
+            'headings': [],
+            'first_line': '',
+            'last_line': '',
+            'starts_with_heading': False,
+            'ends_with_incomplete': False
+        }
+
+        lines = content.strip().split('\n')
+        if not lines:
+            return structure
+
+        structure['first_line'] = lines[0].strip()
+        structure['last_line'] = lines[-1].strip()
+
+        # Check if starts with heading
+        if lines[0].strip().startswith('#'):
+            structure['starts_with_heading'] = True
+
+        # Extract headings with their positions
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line.startswith('#'):
+                level = len(line) - len(line.lstrip('#'))
+                title = line.lstrip('#').strip()
+                structure['headings'].append({
+                    'level': level,
+                    'title': title,
+                    'line_number': i,
+                    'page_range': f"{start_page+1}-{end_page}"
+                })
+
+        # Check if ends with incomplete content (no period, short line)
+        if structure['last_line'] and len(structure['last_line']) < 50 and not structure['last_line'].endswith('.'):
+            structure['ends_with_incomplete'] = True
+
+        return structure
+
+    def _parse_pdf_single_pass(self, pdf_path: str, output_dir: str, max_pages: int) -> Optional[Dict]:
+        """Parse PDF in single pass for smaller documents"""
+        try:
+            logger.info(f"🔍 Parsing PDF with Nougat: {os.path.basename(pdf_path)} (pages 1-{max_pages})")
+
+            # Adjust timeout based on page count
+            timeout_seconds = max(300, max_pages * 8)  # 8 seconds per page, minimum 5 minutes
+
+            # Run Nougat on the PDF with page limit
+            cmd_args = ['--markdown', '--batchsize', '1']
+            if max_pages:
+                cmd_args.extend(['--pages', f"1-{max_pages}"])
+
+            cmd = self._get_nougat_command(pdf_path, output_dir, cmd_args)
+
+            logger.info(f"🚀 Running Nougat with {timeout_seconds//60}min timeout...")
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_seconds)
+
             if result.returncode != 0:
                 logger.error(f"Nougat parsing failed: {result.stderr}")
                 return None
-            
+
             # Find the output file
             pdf_name = Path(pdf_path).stem
             output_file = os.path.join(output_dir, f"{pdf_name}.mmd")
-            
+
             if not os.path.exists(output_file):
                 logger.error(f"Nougat output file not found: {output_file}")
                 return None
-            
+
             # Parse the Nougat output
             with open(output_file, 'r', encoding='utf-8') as f:
                 nougat_content = f.read()
-            
+
             # Analyze and structure the content
             structured_content = self._analyze_nougat_output(nougat_content, pdf_path)
-            
+
             logger.info(f"✅ Nougat parsing completed successfully")
             return structured_content
-            
+
         except subprocess.TimeoutExpired:
-            logger.error("Nougat parsing timed out")
+            logger.warning(f"⏰ Nougat parsing timed out after {timeout_seconds//60} minutes - falling back to standard processing")
+            return None
+        except KeyboardInterrupt:
+            logger.warning("🛑 Nougat parsing interrupted by user - falling back to standard processing")
             return None
         except Exception as e:
             logger.error(f"Error during Nougat parsing: {e}")
             return None
-    
+
+    def _combine_batch_results(self, batch_results: List[Dict], pdf_path: str) -> Dict:
+        """Combine results from multiple batches into a single structured document with proper ordering"""
+        logger.info(f"🔗 Combining {len(batch_results)} batch results...")
+
+        # Sort batches by start_page to ensure correct order
+        batch_results.sort(key=lambda x: x['start_page'])
+
+        # Log batch order for debugging
+        for batch in batch_results:
+            logger.debug(f"📦 Batch {batch['batch_num']}: pages {batch['start_page']+1}-{batch['end_page']} ({batch['page_count']} pages)")
+
+        # Combine content with intelligent structure preservation
+        combined_content = ""
+        total_pages = 0
+
+        for i, batch in enumerate(batch_results):
+            batch_content = batch['content'].strip()
+            if not batch_content:
+                continue
+
+            # Add structure-aware separators
+            if i > 0:
+                prev_batch = batch_results[i-1]
+                separator = self._get_intelligent_separator(prev_batch, batch)
+                combined_content += separator
+
+            # Add batch content with structure markers
+            combined_content += f"<!-- BATCH_START_{batch['batch_num']}_PAGES_{batch['start_page']+1}-{batch['end_page']} -->\n"
+            combined_content += batch_content
+            combined_content += f"\n<!-- BATCH_END_{batch['batch_num']} -->"
+
+            total_pages += batch['page_count']
+            logger.debug(f"✅ Added batch {batch['batch_num']} content ({len(batch_content)} chars) with structure preservation")
+
+        # Analyze the combined content with structure preservation
+        structured_content = self._analyze_nougat_output_with_structure(combined_content, pdf_path, batch_results)
+
+        # Add batch processing metadata
+        structured_content['metadata']['batch_processing'] = {
+            'total_batches': len(batch_results),
+            'total_pages_processed': total_pages,
+            'batch_info': [
+                {
+                    'batch_num': batch['batch_num'],
+                    'pages': f"{batch['start_page']+1}-{batch['end_page']}",
+                    'page_count': batch['page_count'],
+                    'content_length': len(batch['content'])
+                }
+                for batch in batch_results
+            ]
+        }
+
+        logger.info(f"✅ Combined {len(batch_results)} batches into unified document with preserved structure")
+        return structured_content
+
+    def _get_intelligent_separator(self, prev_batch: Dict, current_batch: Dict) -> str:
+        """Get intelligent separator between batches based on their structure"""
+        prev_structure = prev_batch.get('structure', {})
+        current_structure = current_batch.get('structure', {})
+
+        # If previous batch ends incomplete and current starts with continuation
+        if (prev_structure.get('ends_with_incomplete', False) and
+            not current_structure.get('starts_with_heading', False)):
+            return "\n"  # Minimal separator for continuation
+
+        # If current batch starts with a heading, use section break
+        if current_structure.get('starts_with_heading', False):
+            return "\n\n<!-- SECTION_BREAK -->\n\n"
+
+        # Default paragraph break
+        return "\n\n<!-- PARAGRAPH_BREAK -->\n\n"
+
+    def _handle_failed_batch(self, pdf_path: str, batch_num: int, start_page: int, end_page: int, error: str):
+        """Handle failed batch with dead letter queue logic"""
+        if pdf_path not in self.failed_pages:
+            self.failed_pages[pdf_path] = {}
+
+        batch_key = f"batch_{batch_num}"
+        if batch_key not in self.failed_pages[pdf_path]:
+            self.failed_pages[pdf_path][batch_key] = 0
+
+        self.failed_pages[pdf_path][batch_key] += 1
+        failure_count = self.failed_pages[pdf_path][batch_key]
+
+        if failure_count >= self.max_retries:
+            # Move to quarantine
+            self._quarantine_batch(pdf_path, batch_num, start_page, end_page, error)
+            logger.warning(f"🚫 Batch {batch_num} quarantined after {failure_count} failures")
+            return False
+        else:
+            logger.warning(f"⚠️ Batch {batch_num} failed (attempt {failure_count}/{self.max_retries}): {error}")
+            return True  # Can retry
+
+    def _quarantine_batch(self, pdf_path: str, batch_num: int, start_page: int, end_page: int, error: str):
+        """Move failed batch to quarantine for later inspection"""
+        quarantine_info = {
+            'pdf_path': pdf_path,
+            'batch_num': batch_num,
+            'start_page': start_page,
+            'end_page': end_page,
+            'error': error,
+            'timestamp': time.time(),
+            'failure_count': self.failed_pages[pdf_path][f"batch_{batch_num}"]
+        }
+
+        # Save quarantine info
+        quarantine_file = os.path.join(
+            self.quarantine_dir,
+            f"{os.path.basename(pdf_path)}_batch_{batch_num}_quarantine.json"
+        )
+
+        import json
+        with open(quarantine_file, 'w') as f:
+            json.dump(quarantine_info, f, indent=2)
+
+        logger.info(f"📋 Quarantine info saved: {quarantine_file}")
+
+    def get_quarantine_report(self) -> Dict:
+        """Get report of all quarantined batches"""
+        quarantine_files = list(Path(self.quarantine_dir).glob("*_quarantine.json"))
+
+        report = {
+            'total_quarantined': len(quarantine_files),
+            'quarantined_batches': []
+        }
+
+        import json
+        for qfile in quarantine_files:
+            try:
+                with open(qfile, 'r') as f:
+                    quarantine_info = json.load(f)
+                report['quarantined_batches'].append(quarantine_info)
+            except Exception as e:
+                logger.warning(f"Could not read quarantine file {qfile}: {e}")
+
+        return report
+
+    def _check_gpu_acceleration(self):
+        """Check if GPU acceleration is available for Nougat"""
+        try:
+            # Check if CUDA is available
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = torch.cuda.device_count()
+                gpu_name = torch.cuda.get_device_name(0) if gpu_count > 0 else "Unknown"
+                logger.info(f"🚀 GPU acceleration available: {gpu_name} ({gpu_count} device(s))")
+                logger.info(f"💡 PERFORMANCE TIP: Nougat will be 10-50x faster with GPU acceleration")
+                return True
+            else:
+                logger.warning("⚠️ GPU acceleration not available - Nougat will run on CPU (much slower)")
+                logger.warning("💡 PERFORMANCE TIP: Install CUDA-compatible PyTorch for 10-50x speedup")
+                logger.warning("   Run: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121")
+                return False
+        except ImportError:
+            logger.warning("⚠️ PyTorch not found - cannot check GPU acceleration")
+            return False
+        except Exception as e:
+            logger.warning(f"⚠️ Error checking GPU acceleration: {e}")
+            return False
+
     def _analyze_nougat_output(self, content: str, pdf_path: str) -> Dict:
         """
         Analyze Nougat output and extract structured information
@@ -378,7 +1012,156 @@ class NougatIntegration:
                    f"{len(analysis['tables'])} tables, {len(analysis['sections'])} sections")
         
         return analysis
-    
+
+    def _analyze_nougat_output_with_structure(self, content: str, pdf_path: str, batch_results: List[Dict]) -> Dict:
+        """
+        Analyze Nougat output with batch structure preservation for proper ordering
+
+        Args:
+            content: Combined Nougat markdown output
+            pdf_path: Original PDF path for reference
+            batch_results: List of batch results with page information
+
+        Returns:
+            Structured content dictionary with preserved ordering
+        """
+        logger.info("📊 Analyzing Nougat output with structure preservation...")
+
+        # First do standard analysis
+        analysis = self._analyze_nougat_output(content, pdf_path)
+
+        # Then enhance with batch-aware structure preservation
+        analysis['sections'] = self._extract_sections_with_batch_order(content, batch_results)
+        analysis['text_blocks'] = self._extract_text_blocks_with_order(content, batch_results)
+
+        # Add structure validation
+        analysis['structure_validation'] = self._validate_document_structure(analysis, batch_results)
+
+        logger.info(f"📈 Structure-aware analysis complete: {len(analysis['sections'])} sections with preserved order")
+
+        return analysis
+
+    def _extract_sections_with_batch_order(self, content: str, batch_results: List[Dict]) -> List[Dict]:
+        """Extract sections while preserving batch order"""
+        sections = []
+
+        # Split content by new batch markers
+        import re
+        batch_pattern = r'<!-- BATCH_START_(\d+)_PAGES_(\d+-\d+) -->(.*?)<!-- BATCH_END_\1 -->'
+        batch_matches = re.finditer(batch_pattern, content, re.DOTALL)
+
+        for match in batch_matches:
+            batch_num = int(match.group(1))
+            page_range = match.group(2)
+            batch_content = match.group(3).strip()
+
+            if not batch_content:
+                continue
+
+            # Find corresponding batch info
+            batch_info = None
+            for batch in batch_results:
+                if batch['batch_num'] == batch_num:
+                    batch_info = batch
+                    break
+
+            # Extract sections from this batch
+            batch_sections = self._extract_sections(batch_content)
+
+            # Add batch information to sections
+            for section in batch_sections:
+                if batch_info:
+                    section['batch_num'] = batch_info['batch_num']
+                    section['start_page'] = batch_info['start_page']
+                    section['end_page'] = batch_info['end_page']
+                    section['batch_order'] = batch_info['start_page']  # Use start_page for ordering
+                    section['page_range'] = page_range
+
+                sections.append(section)
+
+        # Sort by start_page to ensure correct document order
+        sections.sort(key=lambda x: (x.get('batch_order', 0), x.get('position', (0, 0))[0]))
+
+        logger.debug(f"Extracted {len(sections)} sections with batch order preservation")
+        return sections
+
+    def _extract_text_blocks_with_order(self, content: str, batch_results: List[Dict]) -> List[Dict]:
+        """Extract text blocks while preserving batch order"""
+        text_blocks = []
+
+        # Split content by new batch markers
+        import re
+        batch_pattern = r'<!-- BATCH_START_(\d+)_PAGES_(\d+-\d+) -->(.*?)<!-- BATCH_END_\1 -->'
+        batch_matches = re.finditer(batch_pattern, content, re.DOTALL)
+
+        for match in batch_matches:
+            batch_num = int(match.group(1))
+            page_range = match.group(2)
+            batch_content = match.group(3).strip()
+
+            if not batch_content:
+                continue
+
+            # Find corresponding batch info
+            batch_info = None
+            for batch in batch_results:
+                if batch['batch_num'] == batch_num:
+                    batch_info = batch
+                    break
+
+            # Extract text blocks from this batch
+            batch_text_blocks = self._extract_text_blocks(batch_content)
+
+            # Add batch information to text blocks
+            for block in batch_text_blocks:
+                if batch_info:
+                    block['batch_num'] = batch_info['batch_num']
+                    block['start_page'] = batch_info['start_page']
+                    block['end_page'] = batch_info['end_page']
+                    block['batch_order'] = batch_info['start_page']  # Use start_page for ordering
+                    block['page_range'] = page_range
+
+                text_blocks.append(block)
+
+        # Sort by start_page to ensure correct document order
+        text_blocks.sort(key=lambda x: x.get('batch_order', 0))
+
+        logger.debug(f"Extracted {len(text_blocks)} text blocks with batch order preservation")
+        return text_blocks
+
+    def _validate_document_structure(self, analysis: Dict, batch_results: List[Dict]) -> Dict:
+        """Validate that document structure is properly preserved"""
+        validation = {
+            'batch_count': len(batch_results),
+            'sections_per_batch': {},
+            'content_distribution': {},
+            'structure_integrity': True,
+            'warnings': []
+        }
+
+        # Check sections distribution across batches
+        for section in analysis['sections']:
+            batch_num = section.get('batch_num', 'unknown')
+            if batch_num not in validation['sections_per_batch']:
+                validation['sections_per_batch'][batch_num] = 0
+            validation['sections_per_batch'][batch_num] += 1
+
+        # Check for potential ordering issues
+        batch_orders = [section.get('batch_order', 0) for section in analysis['sections']]
+        if batch_orders != sorted(batch_orders):
+            validation['structure_integrity'] = False
+            validation['warnings'].append("Section ordering may be incorrect")
+
+        # Check content distribution
+        for batch in batch_results:
+            batch_num = batch['batch_num']
+            validation['content_distribution'][batch_num] = {
+                'pages': f"{batch['start_page']+1}-{batch['end_page']}",
+                'content_length': batch.get('content_length', 0)
+            }
+
+        return validation
+
     def _extract_math_equations(self, content: str) -> List[Dict]:
         """Extract mathematical equations from Nougat output"""
         equations = []

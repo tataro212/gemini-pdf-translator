@@ -114,20 +114,43 @@ class AsyncTranslationService:
         self.settings = config_manager.gemini_settings
         self.translation_settings = config_manager.translation_enhancement_settings
         
-        # Concurrency settings
-        self.max_concurrent = config_manager.get_config_value(
-            'AsyncOptimization', 'max_concurrent_translations', 10, int
-        )
-        self.request_delay = config_manager.get_config_value(
-            'AsyncOptimization', 'request_delay_ms', 100, int
-        ) / 1000.0  # Convert to seconds
+        # Concurrency settings - read from config.ini
+        try:
+            # Try to get from TranslationEnhancement section first (where max_concurrent_tasks is defined)
+            if hasattr(config_manager, 'translation_enhancement_settings'):
+                self.max_concurrent = config_manager.translation_enhancement_settings.get('max_concurrent_tasks', 5)
+            # Try to get from GeminiAPI section (where max_concurrent_api_calls is defined)
+            elif hasattr(config_manager, 'gemini_api_settings'):
+                self.max_concurrent = config_manager.gemini_api_settings.get('max_concurrent_api_calls', 5)
+            # Fallback to direct config access
+            elif hasattr(config_manager, 'get_config_value'):
+                # Try TranslationEnhancement first
+                self.max_concurrent = config_manager.get_config_value('TranslationEnhancement', 'max_concurrent_tasks', 5, int)
+                if self.max_concurrent == 5:  # Default value, try GeminiAPI
+                    self.max_concurrent = config_manager.get_config_value('GeminiAPI', 'max_concurrent_api_calls', 5, int)
+            else:
+                self.max_concurrent = 5  # Conservative default for Gemini 2.5
+
+            # Set request delay based on model (Gemini 2.5 can handle more concurrent requests)
+            self.request_delay = 0.05  # 50ms delay for Gemini 2.5
+
+        except Exception as e:
+            logger.warning(f"Could not get async config: {e}, using defaults")
+            self.max_concurrent = 5  # Conservative default for Gemini 2.5
+            self.request_delay = 0.05
         
         # Two-tier caching
-        self.memory_cache = InMemoryCache(
-            max_size=config_manager.get_config_value(
-                'AsyncOptimization', 'memory_cache_size', 1000, int
-            )
-        )
+        try:
+            if hasattr(config_manager, 'get_value'):
+                cache_size = config_manager.get_value('async_optimization', 'memory_cache_size', 1000)
+            elif hasattr(config_manager, 'get_config_value'):
+                cache_size = config_manager.get_config_value('AsyncOptimization', 'memory_cache_size', 1000, int)
+            else:
+                cache_size = 1000
+        except Exception:
+            cache_size = 1000
+
+        self.memory_cache = InMemoryCache(max_size=cache_size)
         self.persistent_cache = advanced_cache_manager
         
         # Performance tracking
@@ -619,15 +642,24 @@ class PreemptiveImageFilter:
     """
 
     def __init__(self):
-        self.min_complexity_threshold = config_manager.get_config_value(
-            'ImageFiltering', 'min_complexity_threshold', 0.3, float
-        )
-        self.min_size_bytes = config_manager.get_config_value(
-            'ImageFiltering', 'min_size_bytes', 10000, int
-        )
-        self.max_simple_colors = config_manager.get_config_value(
-            'ImageFiltering', 'max_simple_colors', 5, int
-        )
+        try:
+            if hasattr(config_manager, 'get_value'):
+                self.min_complexity_threshold = config_manager.get_value('image_filtering', 'min_complexity_threshold', 0.3)
+                self.min_size_bytes = config_manager.get_value('image_filtering', 'min_size_bytes', 10000)
+                self.max_simple_colors = config_manager.get_value('image_filtering', 'max_simple_colors', 5)
+            elif hasattr(config_manager, 'get_config_value'):
+                self.min_complexity_threshold = config_manager.get_config_value('ImageFiltering', 'min_complexity_threshold', 0.3, float)
+                self.min_size_bytes = config_manager.get_config_value('ImageFiltering', 'min_size_bytes', 10000, int)
+                self.max_simple_colors = config_manager.get_config_value('ImageFiltering', 'max_simple_colors', 5, int)
+            else:
+                self.min_complexity_threshold = 0.3
+                self.min_size_bytes = 10000
+                self.max_simple_colors = 5
+        except Exception as e:
+            logger.warning(f"Could not get image filtering config: {e}, using defaults")
+            self.min_complexity_threshold = 0.3
+            self.min_size_bytes = 10000
+            self.max_simple_colors = 5
 
         logger.info(f"🔍 PreemptiveImageFilter initialized:")
         logger.info(f"   • Min complexity: {self.min_complexity_threshold}")

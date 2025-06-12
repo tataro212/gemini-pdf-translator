@@ -40,15 +40,48 @@ class ImagePreprocessor:
     """Advanced image preprocessing for improved OCR accuracy"""
 
     def __init__(self):
-        self.preprocessing_settings = {
-            'enable_grayscale': config_manager.get_config_value('OCRPreprocessing', 'enable_ocr_grayscale', True, bool),
-            'enable_binarization': config_manager.get_config_value('OCRPreprocessing', 'enable_binarization', True, bool),
-            'binarization_threshold': config_manager.get_config_value('OCRPreprocessing', 'binarization_threshold', 'auto'),
-            'enable_noise_reduction': config_manager.get_config_value('OCRPreprocessing', 'enable_noise_reduction', True, bool),
-            'enable_deskewing': config_manager.get_config_value('OCRPreprocessing', 'enable_deskewing', False, bool),
-            'enhance_contrast': config_manager.get_config_value('OCRPreprocessing', 'enhance_contrast', True, bool),
-            'upscale_factor': config_manager.get_config_value('OCRPreprocessing', 'upscale_factor', 2.0, float)
-        }
+        try:
+            if hasattr(config_manager, 'get_value'):
+                self.preprocessing_settings = {
+                    'enable_grayscale': config_manager.get_value('ocr_preprocessing', 'enable_ocr_grayscale', True),
+                    'enable_binarization': config_manager.get_value('ocr_preprocessing', 'enable_binarization', True),
+                    'binarization_threshold': config_manager.get_value('ocr_preprocessing', 'binarization_threshold', 'auto'),
+                    'enable_noise_reduction': config_manager.get_value('ocr_preprocessing', 'enable_noise_reduction', True),
+                    'enable_deskewing': config_manager.get_value('ocr_preprocessing', 'enable_deskewing', False),
+                    'enhance_contrast': config_manager.get_value('ocr_preprocessing', 'enhance_contrast', True),
+                    'upscale_factor': config_manager.get_value('ocr_preprocessing', 'upscale_factor', 2.0)
+                }
+            elif hasattr(config_manager, 'get_config_value'):
+                self.preprocessing_settings = {
+                    'enable_grayscale': config_manager.get_config_value('OCRPreprocessing', 'enable_ocr_grayscale', True, bool),
+                    'enable_binarization': config_manager.get_config_value('OCRPreprocessing', 'enable_binarization', True, bool),
+                    'binarization_threshold': config_manager.get_config_value('OCRPreprocessing', 'binarization_threshold', 'auto'),
+                    'enable_noise_reduction': config_manager.get_config_value('OCRPreprocessing', 'enable_noise_reduction', True, bool),
+                    'enable_deskewing': config_manager.get_config_value('OCRPreprocessing', 'enable_deskewing', False, bool),
+                    'enhance_contrast': config_manager.get_config_value('OCRPreprocessing', 'enhance_contrast', True, bool),
+                    'upscale_factor': config_manager.get_config_value('OCRPreprocessing', 'upscale_factor', 2.0, float)
+                }
+            else:
+                self.preprocessing_settings = {
+                    'enable_grayscale': True,
+                    'enable_binarization': True,
+                    'binarization_threshold': 'auto',
+                    'enable_noise_reduction': True,
+                    'enable_deskewing': False,
+                    'enhance_contrast': True,
+                    'upscale_factor': 2.0
+                }
+        except Exception as e:
+            logger.warning(f"Could not get OCR preprocessing config: {e}, using defaults")
+            self.preprocessing_settings = {
+                'enable_grayscale': True,
+                'enable_binarization': True,
+                'binarization_threshold': 'auto',
+                'enable_noise_reduction': True,
+                'enable_deskewing': False,
+                'enhance_contrast': True,
+                'upscale_factor': 2.0
+            }
 
         self.opencv_available = OPENCV_AVAILABLE
         self.advanced_available = ADVANCED_OCR_AVAILABLE

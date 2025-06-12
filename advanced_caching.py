@@ -41,10 +41,28 @@ class ContextualCacheManager:
         self.enabled = self.settings['use_translation_cache']
         
         # Cache configuration
-        self.max_cache_size = config_manager.get_config_value('AdvancedCaching', 'max_cache_entries', 10000, int)
-        self.similarity_threshold = config_manager.get_config_value('AdvancedCaching', 'similarity_threshold', 0.85, float)
-        self.context_window_size = config_manager.get_config_value('AdvancedCaching', 'context_window_chars', 200, int)
-        self.enable_fuzzy_matching = config_manager.get_config_value('AdvancedCaching', 'enable_fuzzy_matching', True, bool)
+        try:
+            if hasattr(config_manager, 'get_value'):
+                self.max_cache_size = config_manager.get_value('advanced_caching', 'max_cache_entries', 10000)
+                self.similarity_threshold = config_manager.get_value('advanced_caching', 'similarity_threshold', 0.85)
+                self.context_window_size = config_manager.get_value('advanced_caching', 'context_window_chars', 200)
+                self.enable_fuzzy_matching = config_manager.get_value('advanced_caching', 'enable_fuzzy_matching', True)
+            elif hasattr(config_manager, 'get_config_value'):
+                self.max_cache_size = config_manager.get_config_value('AdvancedCaching', 'max_cache_entries', 10000, int)
+                self.similarity_threshold = config_manager.get_config_value('AdvancedCaching', 'similarity_threshold', 0.85, float)
+                self.context_window_size = config_manager.get_config_value('AdvancedCaching', 'context_window_chars', 200, int)
+                self.enable_fuzzy_matching = config_manager.get_config_value('AdvancedCaching', 'enable_fuzzy_matching', True, bool)
+            else:
+                self.max_cache_size = 10000
+                self.similarity_threshold = 0.85
+                self.context_window_size = 200
+                self.enable_fuzzy_matching = True
+        except Exception as e:
+            logger.warning(f"Could not get advanced caching config: {e}, using defaults")
+            self.max_cache_size = 10000
+            self.similarity_threshold = 0.85
+            self.context_window_size = 200
+            self.enable_fuzzy_matching = True
         
         # In-memory cache
         self.cache: Dict[str, CacheEntry] = {}
