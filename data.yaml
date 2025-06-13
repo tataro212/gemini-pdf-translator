@@ -1,0 +1,5 @@
+train: C:/Users/30694/datasets/publaynet_yolo/images/train
+val: C:/Users/30694/datasets/publaynet_yolo/images/val
+
+nc: 5  # number of classes
+names: ['text', 'title', 'list', 'table', 'figure'] 
