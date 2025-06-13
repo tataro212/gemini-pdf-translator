@@ -1169,7 +1169,6 @@ class UltimatePDFTranslator:
             if not pdf_success:
                 logger.warning("⚠️ PDF conversion failed, but Word document was created successfully")
                 logger.info(f"💡 Word document available at: {saved_word_filepath}")
-                logger.info("💡 You can manually convert the Word document to PDF if needed")
 
             # Step 10: Upload to Google Drive (if configured)
             drive_results = []
@@ -1440,6 +1439,7 @@ class UltimatePDFTranslator:
 """
 
         if drive_results:
+            from drive_uploader import drive_uploader # Corrected import statement
             report += f"\n{drive_uploader.get_upload_summary(drive_results)}"
 
         if not pdf_success:
@@ -2286,14 +2286,17 @@ async def main():
 """
 
         if drive_results:
-            from google_drive_uploader import drive_uploader
+            from drive_uploader import drive_uploader # Corrected import statement
             report += f"\n{drive_uploader.get_upload_summary(drive_results)}"
 
         if not pdf_success:
             report += f"""
-⚠️ PDF CONVERSION WARNINGS:
-• PDF conversion failed, but Word document was created successfully
-• You can manually convert the Word document to PDF if needed
+
+⚠️ PDF CONVERSION TROUBLESHOOTING:
+• Ensure Microsoft Word is installed and licensed
+• Check Windows permissions and antivirus settings
+• Try running as administrator
+• Alternative: Use online PDF converters or LibreOffice
 """
 
         logger.info(report)
