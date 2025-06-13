@@ -10,8 +10,8 @@ import time
 import json
 import hashlib
 import logging
-import tkinter as tk
-from tkinter import filedialog
+# import tkinter as tk # Commented out for testing in environment without tkinter
+# from tkinter import filedialog # Commented out for testing
 
 logger = logging.getLogger(__name__)
 
@@ -107,62 +107,62 @@ def get_desktop_path():
         return desktop_path_el
     return os.path.expanduser("~")
 
-def choose_input_path():
-    """Choose input file or directory using file dialog"""
-    root = None
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
+# def choose_input_path():
+#     """Choose input file or directory using file dialog"""
+#     root = None
+#     try:
+#         root = tk.Tk()
+#         root.withdraw()
+#         root.attributes('-topmost', True)
         
-        choice = input("Process a single file (f) or entire directory (d)? [f/d]: ").lower().strip()
+#         choice = input("Process a single file (f) or entire directory (d)? [f/d]: ").lower().strip()
         
-        if choice == 'd':
-            logger.info("Please select the directory containing PDF files...")
-            selected_directory = filedialog.askdirectory(
-                title="Select Directory with PDF Files",
-                initialdir=get_desktop_path()
-            )
-            return selected_directory, 'dir'
-        else:
-            logger.info("Please select a PDF file to translate...")
-            selected_file = filedialog.askopenfilename(
-                title="Select PDF File to Translate",
-                filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
-                initialdir=get_desktop_path()
-            )
-            return selected_file, 'file'
+#         if choice == 'd':
+#             logger.info("Please select the directory containing PDF files...")
+#             selected_directory = filedialog.askdirectory(
+#                 title="Select Directory with PDF Files",
+#                 initialdir=get_desktop_path()
+#             )
+#             return selected_directory, 'dir'
+#         else:
+#             logger.info("Please select a PDF file to translate...")
+#             selected_file = filedialog.askopenfilename(
+#                 title="Select PDF File to Translate",
+#                 filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")],
+#                 initialdir=get_desktop_path()
+#             )
+#             return selected_file, 'file'
             
-    except Exception as e:
-        logger.error(f"Error in file selection: {e}")
-        return None, None
-    finally:
-        if root:
-            root.destroy()
+#     except Exception as e:
+#         logger.error(f"Error in file selection: {e}")
+#         return None, None
+#     finally:
+#         if root:
+#             root.destroy()
 
-def choose_base_output_directory(initial_dir=None):
-    """Choose base output directory for results"""
-    logger.info("\nΠαρακαλώ επιλέξτε τον ΚΥΡΙΟ φάκελο όπου θα δημιουργηθούν όλοι οι υποφάκελοι εξόδου...")
-    root = None
-    chosen_directory = None
+# def choose_base_output_directory(initial_dir=None):
+#     """Choose base output directory for results"""
+#     logger.info("\nΠαρακαλώ επιλέξτε τον ΚΥΡΙΟ φάκελο όπου θα δημιουργηθούν όλοι οι υποφάκελοι εξόδου...")
+#     root = None
+#     chosen_directory = None
     
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
+#     try:
+#         root = tk.Tk()
+#         root.withdraw()
+#         root.attributes('-topmost', True)
         
-        chosen_directory = filedialog.askdirectory(
-            title="Select Main Output Directory",
-            initialdir=initial_dir or get_desktop_path()
-        )
+#         chosen_directory = filedialog.askdirectory(
+#             title="Select Main Output Directory",
+#             initialdir=initial_dir or get_desktop_path()
+#         )
         
-    except Exception as e:
-        logger.error(f"Error selecting output directory: {e}")
-    finally:
-        if root:
-            root.destroy()
+#     except Exception as e:
+#         logger.error(f"Error selecting output directory: {e}")
+#     finally:
+#         if root:
+#             root.destroy()
     
-    return chosen_directory
+#     return chosen_directory
 
 def get_specific_output_dir_for_file(main_base_output_dir, source_pdf_filepath):
     """Create specific output directory for a PDF file with proper path handling"""

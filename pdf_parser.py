@@ -1847,19 +1847,26 @@ class StructuredContentExtractor:
             return elements
 
         # Analyze page layout to detect columns
+        logger.debug("Analyzing page layout for reading order...")
         layout_analysis = self._analyze_page_layout(elements)
 
         if layout_analysis['is_multi_column']:
+            logger.info(f"Multi-column layout detected. Columns: {len(layout_analysis.get('columns', []))}")
             sorted_elements = self._sort_multi_column_layout(elements, layout_analysis)
         else:
+            logger.info("Single-column layout detected.")
             sorted_elements = self._sort_single_column_layout(elements)
 
         # Assign reading order positions
         for i, element in enumerate(sorted_elements):
             element['reading_order_position'] = i
 
-        logger.debug(f"Applied spatial reading order to {len(sorted_elements)} elements "
-                    f"(multi-column: {layout_analysis['is_multi_column']})")
+        logger.info(f"Applied spatial reading order. Total elements: {len(sorted_elements)}. Multi-column: {layout_analysis['is_multi_column']}.")
+        if sorted_elements:
+            logger.debug("First 5 elements in reading order:")
+            for idx, elem in enumerate(sorted_elements[:5]):
+                content_preview = elem.get('content', 'N/A')[:50].replace('\n', ' ')
+                logger.debug(f"  {idx+1}. BBox: {elem['bbox']}, Content: '{content_preview}...'")
         return sorted_elements
 
     def _analyze_page_layout(self, elements):
@@ -1927,41 +1934,57 @@ class StructuredContentExtractor:
         """
         Sort elements in multi-column layout using reading bands approach.
 
-        Primary sort: Vertical position (reading bands)
-        Secondary sort: Horizontal position (left to right within each band)
-
-        This produces natural reading order: L1, R1, L2, R2 instead of L1, L2, R1, R2
+        Primary sort: Vertical position (Y-coordinate), then Horizontal position (X-coordinate) within each column.
+        Columns are then concatenated from left to right.
         """
         if not elements:
             return []
 
-        # Step 1: Calculate adaptive line tolerance based on actual content
-        total_height = sum(abs(el['bbox'][3] - el['bbox'][1]) for el in elements if el['bbox'])
-        avg_height = total_height / len(elements) if elements else 10
+        columns_data = layout_analysis.get('columns', [])
+        if not columns_data: # Fallback if column detection failed to define columns
+            logger.warning("Multi-column layout detected but no column boundaries found. Using single column sort as fallback.")
+            return self._sort_single_column_layout(elements)
 
-        # A good tolerance is typically half the average line height
-        # This groups elements on the same line without accidentally grouping different lines
-        line_height_tolerance = max(5, avg_height / 2) if avg_height > 0 else 5
-
-        logger.debug(f"Multi-column sort: avg_height={avg_height:.1f}, tolerance={line_height_tolerance:.1f}")
-
-        # Step 2: Sort by reading bands (vertical position first, then horizontal)
-        sorted_elements = sorted(
-            elements,
-            key=lambda block: (
-                -round(block['bbox'][1] / line_height_tolerance),  # Primary: vertical "band" (negative for top-to-bottom)
-                block['bbox'][0]                                   # Secondary: horizontal position
-            )
-        )
-
-        # Debug: Log the reading order for verification
-        logger.debug("Multi-column reading order:")
-        for i, element in enumerate(sorted_elements[:10]):  # Show first 10 elements
+        # Assign elements to columns
+        elements_in_columns = [[] for _ in columns_data]
+        for element in elements:
             bbox = element['bbox']
-            content = element.get('content', 'Unknown')[:30]
-            band = round(bbox[1] / line_height_tolerance)
-            logger.debug(f"  {i+1}. Band {band}, x={bbox[0]:.0f}: '{content}...'")
+            element_center_x = (bbox[0] + bbox[2]) / 2
+            assigned_to_column = False
+            for i, col in enumerate(columns_data):
+                if col['left'] <= element_center_x < col['right']:
+                    elements_in_columns[i].append(element)
+                    assigned_to_column = True
+                    break
+            if not assigned_to_column: # If element doesn't fit neatly, assign to nearest column or handle as outlier
+                # For now, assign to the last column if it's to the right, or first if to the left, or skip
+                if element_center_x >= columns_data[-1]['right']:
+                    elements_in_columns[-1].append(element)
+                elif element_center_x < columns_data[0]['left']:
+                     elements_in_columns[0].append(element)
+                else: # Could be an element spanning columns or in a gutter; log and assign based on proximity
+                    logger.debug(f"Element {element.get('element_id', 'N/A')} at {bbox} not fitting neatly into columns. Assigning to closest.")
+                    # Simplified: find closest column by center distance
+                    closest_col_idx = 0
+                    min_dist = float('inf')
+                    for i, col in enumerate(columns_data):
+                        dist = abs(element_center_x - col['center'])
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_col_idx = i
+                    elements_in_columns[closest_col_idx].append(element)
 
+
+        # Sort elements within each column (top-to-bottom, then left-to-right)
+        for i in range(len(elements_in_columns)):
+            elements_in_columns[i].sort(key=lambda el: (el['bbox'][1], el['bbox'][0]))
+
+        # Concatenate sorted elements from columns
+        sorted_elements = []
+        for col_elements in elements_in_columns:
+            sorted_elements.extend(col_elements)
+
+        logger.debug(f"Sorted {len(elements)} elements into {len(columns_data)} columns.")
         return sorted_elements
 
     def _sort_single_column_layout(self, elements):
@@ -2067,72 +2090,88 @@ class StructuredContentExtractor:
             return 'paragraph'
 
         # Check exact font hierarchy match with tolerance
-        for font_size, level in font_hierarchy.items():
-            if abs(primary_font_size - font_size) <= 0.5:  # 0.5pt tolerance
-                return f'h{level}'
+        for h_font_size, h_level in font_hierarchy.items():
+            if abs(primary_font_size - h_font_size) <= 0.5:  # 0.5pt tolerance
+                logger.debug(f"[Adaptive Classifier] Classified as h{h_level} by font hierarchy match: '{text_clean[:100]}...'. Font: {primary_font_size:.1f} (vs {h_font_size:.1f})")
+                return f'h{h_level}'
 
         # Multi-factor heading detection
         heading_score = 0.0
+        score_details = []
 
         # Font size factor
         size_ratio = primary_font_size / dominant_font_size if dominant_font_size > 0 else 1.0
         if size_ratio >= 1.5:
-            heading_score += 0.4
+            heading_score += 0.4; score_details.append(f"SizeRatio>=1.5 ({size_ratio:.2f})")
         elif size_ratio >= 1.2:
-            heading_score += 0.3
+            heading_score += 0.3; score_details.append(f"SizeRatio>=1.2 ({size_ratio:.2f})")
         elif size_ratio >= 1.1:
-            heading_score += 0.2
+            heading_score += 0.2; score_details.append(f"SizeRatio>=1.1 ({size_ratio:.2f})")
 
         # Font weight factor
         if is_bold:
-            heading_score += 0.3
+            heading_score += 0.3; score_details.append("Bold")
 
         # Font style factor
         if is_italic and not is_bold:
-            heading_score += 0.1  # Italic alone is weaker indicator
+            heading_score += 0.1; score_details.append("ItalicOnly") # Italic alone is weaker indicator
 
         # Font family factor (different from body text)
         if primary_font and body_text_style:
             if primary_font.lower() not in body_text_style.lower():
-                heading_score += 0.2
+                heading_score += 0.2; score_details.append("DiffFontFamily")
 
         # Text length factor (shorter text more likely to be heading)
         if text_length <= 50:
-            heading_score += 0.2
+            heading_score += 0.2; score_details.append(f"Len<=50 ({text_length})")
         elif text_length <= 100:
-            heading_score += 0.1
+            heading_score += 0.1; score_details.append(f"Len<=100 ({text_length})")
 
         # Structural patterns
-        if self._has_heading_patterns(text_clean):
-            heading_score += 0.3
+        has_patterns = self._has_heading_patterns(text_clean)
+        if has_patterns:
+            heading_score += 0.3; score_details.append("HasPatterns")
 
         # Position-based hints (if available)
-        if self._appears_to_be_section_start(text_clean):
-            heading_score += 0.2
+        appears_section_start = self._appears_to_be_section_start(text_clean)
+        if appears_section_start:
+            heading_score += 0.2; score_details.append("SectionStart")
 
         # Color factor (non-black text might be headings)
         if font_color != 0:  # Non-black color
-            heading_score += 0.1
+            heading_score += 0.1; score_details.append("NonBlackColor")
 
         # Determine heading level based on score and size
-        if heading_score >= 0.6:
-            # Determine level based on font size and other factors
+        # Increased heading_score threshold from 0.6 to 0.7 for more conservative heading detection,
+        # making it harder for a text block to be classified as a heading based on score.
+        final_classification = 'paragraph'
+        if heading_score >= 0.7:
+            level_reason = ""
             if size_ratio >= 1.8 or primary_font_size >= dominant_font_size + 6:
-                return 'h1'
+                final_classification = 'h1'; level_reason = "SizeRatio>=1.8 or AbsSize+6"
             elif size_ratio >= 1.4 or primary_font_size >= dominant_font_size + 4:
-                return 'h2'
+                final_classification = 'h2'; level_reason = "SizeRatio>=1.4 or AbsSize+4"
             elif size_ratio >= 1.2 or primary_font_size >= dominant_font_size + 2:
-                return 'h3'
+                final_classification = 'h3'; level_reason = "SizeRatio>=1.2 or AbsSize+2"
             else:
-                return 'h4'
-        elif heading_score >= 0.4:
-            return 'h4'  # Minor heading
+                final_classification = 'h4'; level_reason = "Default H4 by score"
+            logger.debug(f"[Adaptive Classifier] Classified as {final_classification}: '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). LevelReason: {level_reason}. Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
+            return final_classification
+        # Changed threshold for H4 from 0.4 to 0.5 for more conservative classification
+        elif heading_score >= 0.5: # Minor heading, potentially h4
+            final_classification = 'h4'
+            logger.debug(f"[Adaptive Classifier] Classified as {final_classification} (minor): '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
+            return final_classification
 
-        # Check for special content types
+        # Check for special content types if not a heading
         if self._is_list_item_pattern(text_clean):
+            logger.debug(f"[Adaptive Classifier] Classified as list_item: '{text_clean[:100]}...'")
             return 'list_item'
 
-        # Default to paragraph
+        # Default to paragraph, log if it was borderline
+        # Adjusted borderline logging threshold from 0.3 to 0.2 to capture more potential misses if needed in future tuning
+        if heading_score >= 0.2:
+             logger.debug(f"[Adaptive Classifier] Borderline paragraph: '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
         return 'paragraph'
 
     def _detect_bold_from_flags(self, formatting):
@@ -2153,15 +2192,22 @@ class StructuredContentExtractor:
 
         heading_patterns = [
             r'^\d+\.?\s+[A-Z]',  # "1. Introduction" or "1 Introduction"
-            r'^[A-Z][A-Z\s]{2,}$',  # ALL CAPS headings
-            r'^[A-Z][a-z]+(\s+[A-Z][a-z]+)*$',  # Title Case
+            # ALL CAPS headings (max 5 words) - Constrained to avoid long capitalized sentences.
+            r'^([A-Z]+\s){0,4}[A-Z]+$',
+            # Title Case (max 7 words) - Constrained to avoid long title-cased sentences.
+            r'^([A-Z][a-z]+\s){0,6}[A-Z][a-z]+$',
             r'^(Chapter|Section|Part|Appendix)\s+\d+',  # Chapter/Section numbers
             r'^\d+\.\d+',  # Numbered sections like "2.1"
             r'^[IVX]+\.',  # Roman numerals
             r'^[A-Z]\.',   # Single letter sections "A."
         ]
-
-        return any(re.search(pattern, text) for pattern in heading_patterns)
+        # Check if the text matches any of the defined heading patterns.
+        # These patterns contribute to the heading_score in _classify_content_type_adaptive.
+        for pattern in heading_patterns:
+            if re.search(pattern, text):
+                logger.debug(f"Found heading pattern ({pattern}) in text: '{text[:100]}...'")
+                return True
+        return False
 
     def _appears_to_be_section_start(self, text):
         """Check if text appears to start a new section"""
@@ -3409,12 +3455,14 @@ class StructuredContentExtractor:
         text_length = len(text.strip())
         word_count = len(text.strip().split())
 
-        # Length-based filtering: Long text should not be headings
-        # This prevents paragraph fragments from being classified as headings
-        if word_count > 13:  # More than 13 words is likely a paragraph (updated from 15)
+        # Length-based filtering: Long text should not be headings.
+        # This prevents paragraph fragments from being classified as headings.
+        # Adjusted word_count from 13 to 12 (original was 15) for more conservative heading detection.
+        if word_count > 12: # Max words for a heading
             return 'paragraph'
 
-        if text_length > 100:  # More than 100 characters is likely a paragraph
+        # Adjusted text_length from 100 to 90 for more conservative heading detection.
+        if text_length > 90: # Max characters for a heading
             return 'paragraph'
 
         # Check for list items first (before heading detection)
@@ -3457,41 +3505,63 @@ class StructuredContentExtractor:
         # Check if text has heading characteristics first
         is_likely_heading = self._is_likely_heading(text, text_lower, word_count)
 
+        classified_level = None
+        log_reason = []
+
         # More conservative font size thresholds, but allow semantic detection
         if size_ratio > 1.4:  # Significantly larger than normal text
             if is_likely_heading:
+                log_reason.append(f"SizeRatio > 1.4 ({size_ratio:.2f}) + LikelyH")
                 if size_ratio > 1.8 or any(keyword in text_lower for keyword in ['chapter', 'part', 'introduction', 'conclusion']):
-                    return 'h1'
+                    classified_level = 'h1'
+                    log_reason.append("StrongerRatio/Keyword for H1")
                 elif size_ratio > 1.5 or any(keyword in text_lower for keyword in ['section', 'method', 'result', 'discussion']):
-                    return 'h2'
+                    classified_level = 'h2'
+                    log_reason.append("MidRatio/Keyword for H2")
                 else:
-                    return 'h3'
+                    classified_level = 'h3'
+                    log_reason.append("Default for SizeRatio > 1.4 + LikelyH")
 
         # Medium size increase with strong semantic indicators
         elif size_ratio > 1.2:  # Moderately larger
             if is_likely_heading:
-                # Strong semantic keywords can override moderate size increase
+                log_reason.append(f"SizeRatio > 1.2 ({size_ratio:.2f}) + LikelyH")
                 if any(keyword in text_lower for keyword in ['introduction', 'conclusion', 'methodology', 'results', 'discussion', 'background', 'summary']):
-                    return 'h2'
+                    classified_level = 'h2'
+                    log_reason.append("Keyword for H2")
                 elif word_count <= 3 and (text.istitle() or text.isupper()):  # Very short, formatted text
-                    return 'h3'
+                    classified_level = 'h3'
+                    log_reason.append("Short Title/Upper for H3")
 
         # Even normal size text can be heading with strong semantic indicators
-        elif is_likely_heading and word_count <= 5:
+        elif is_likely_heading and word_count <= 5: # Ensure it's short
+            log_reason.append(f"LikelyH + WC<=5 ({word_count})")
             if any(keyword in text_lower for keyword in ['introduction', 'conclusion', 'methodology', 'results', 'discussion', 'background', 'summary', 'abstract', 'overview']):
-                return 'h2'
+                classified_level = 'h2'
+                log_reason.append("Keyword for H2")
+
+        if classified_level:
+            logger.debug(f"[Legacy Classifier] Classified as {classified_level}: '{text[:100]}...'. Reason: {'; '.join(log_reason)}. Features: SizeRatio: {size_ratio:.2f}, LikelyH: {is_likely_heading}, WC: {word_count}, Len: {text_length}, FontSz: {font_size:.1f}")
+            return classified_level
 
         # Default to paragraph
+        # Log borderline cases for paragraphs if they had some heading characteristics
+        if is_likely_heading or size_ratio > 1.1: # Potential borderline case
+            logger.debug(f"[Legacy Classifier] Borderline paragraph: '{text[:100]}...'. SizeRatio: {size_ratio:.2f}, LikelyH: {is_likely_heading}, WC: {word_count}, Len: {text_length}, FontSz: {font_size:.1f}")
         return 'paragraph'
 
     def _is_likely_heading(self, text, text_lower, word_count):
-        """Determine if text has characteristics of a heading"""
-        # Short text is more likely to be a heading
-        if word_count > 10:
+        """Determine if text has characteristics of a heading (used in older _classify_content_type)"""
+        # Short text is more likely to be a heading.
+        # Adjusted word_count from 10 to 8 for more conservative heading detection.
+        if word_count > 8: # Max words for a heading if not matching other strong criteria
             return False
 
-        # Title case or all caps suggests heading
-        if text.istitle() or text.isupper():
+        # Title case or all caps suggests heading.
+        # Added word_count constraint (<=5) to avoid classifying short, capitalized sentences
+        # (common in paragraphs) as headings.
+        if (text.istitle() or text.isupper()) and word_count <= 5:
+            logger.debug(f"Likely heading (title/upper, short): '{text[:100]}...'")
             return True
 
         # Common heading words
@@ -3501,11 +3571,14 @@ class StructuredContentExtractor:
             'findings', 'implications', 'recommendations', 'future', 'work'
         ]
 
-        if any(keyword in text_lower for keyword in heading_keywords):
-            return True
+        for keyword in heading_keywords:
+            if keyword in text_lower:
+                logger.debug(f"Likely heading (keyword: {keyword}): '{text[:100]}...'")
+                return True
 
         # Ends with colon (often indicates section start)
         if text.strip().endswith(':'):
+            logger.debug(f"Likely heading (ends with colon): '{text[:100]}...'")
             return True
 
         return False
