@@ -1,320 +1,194 @@
-"""
-Hybrid Content Reconciler for Final Document Assembly
+# hybrid_content_reconciler.py
 
-This module implements the comprehensive strategy for reconciling Nougat and PyMuPDF outputs
-into a unified StructuredDocument that ensures TOC and visual elements are correctly placed
-in the final translated document.
-
-Key Features:
-- Parallel processing of Nougat (text/structure) and PyMuPDF (visual assets)
-- Intelligent correlation of image placeholders with actual visual elements
-- Unified ContentBlock generation with proper ordering
-- Visual content bypass for translation (images go directly to output)
-"""
-
-import os
-import re
 import logging
-from typing import List, Dict, Any, Optional, Tuple
-from dataclasses import dataclass
-from pathlib import Path
+from typing import List, Dict, Any, Optional # Added Any, Optional for broader dict compatibility initially
 
-# Import structured document model
+# Attempt to import from structured_document_model, handle potential path issues if running standalone
 try:
-    from structured_document_model import (
-        Document as StructuredDocument, ContentBlock, ContentType,
-        Heading, Paragraph, ImagePlaceholder, Table, CodeBlock, 
-        ListItem, Caption, Equation, create_content_block_from_dict
-    )
-    STRUCTURED_MODEL_AVAILABLE = True
+    from .structured_document_model import ContentBlock, ImagePlaceholder, Paragraph, Heading, ContentType
 except ImportError:
-    STRUCTURED_MODEL_AVAILABLE = False
-    StructuredDocument = None
+    # Fallback for direct execution or if path issues occur in isolated test environments
+    # This assumes structured_document_model.py is in the same directory or Python path
+    from structured_document_model import ContentBlock, ImagePlaceholder, Paragraph, Heading, ContentType
+
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class VisualElement:
-    """Represents a visual element extracted by PyMuPDF"""
-    element_id: str
-    element_type: str  # 'image', 'drawing', 'chart', 'diagram'
-    source_path: str
-    page_num: int
-    bbox: Tuple[float, float, float, float]
-    width: Optional[int] = None
-    height: Optional[int] = None
-    classification: Optional[str] = None  # 'photograph', 'schema', 'diagram'
-
-@dataclass
-class NougatBlock:
-    """Represents a content block from Nougat output"""
-    content_type: str  # 'heading', 'paragraph', 'table', 'image_placeholder'
-    content: str
-    page_num: int
-    line_number: int
-    level: Optional[int] = None  # For headings
-    image_reference: Optional[str] = None  # For image placeholders
-
 class HybridContentReconciler:
     """
-    Reconciles Nougat and PyMuPDF outputs into unified StructuredDocument.
-    
-    This class implements the hybrid parsing strategy that treats Nougat and PyMuPDF
-    as complementary tools, merging their outputs into a single, definitive document
-    structure with all visual elements correctly positioned.
+    Merges text-based analysis (e.g., Nougat) with visual layout analysis
+    (e.g., YOLOv8, PyMuPDF) to create a single, correctly ordered document structure.
     """
-    
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        
-        # Configuration for image correlation
-        self.correlation_config = {
-            'vertical_tolerance': 50,  # pixels
-            'horizontal_tolerance': 100,  # pixels
-            'confidence_threshold': 0.7
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        # Configuration for spatial analysis, e.g., proximity thresholds
+        default_config = {
+            'vertical_tolerance': 50,       # Tolerance for considering elements on the same 'line'
+            'horizontal_tolerance': 100,    # Tolerance for horizontal alignment/overlap
+            'max_y_overlap_for_column': 0.7 # Max Y-overlap ratio to consider elements in same column band
         }
-        
-        # Image bypass configuration - these images skip translation entirely
-        self.image_bypass_config = {
-            'bypass_all_images': True,  # USER REQUIREMENT: No images for translation
-            'preserve_in_output': True,  # Keep images in final document
-            'classification_whitelist': ['photograph', 'schema', 'diagram', 'chart']
-        }
-    
-    def reconcile_content(self, nougat_output: str, visual_elements: List[VisualElement], 
-                         pdf_path: str, output_dir: str) -> StructuredDocument:
+        self.config = default_config
+        if config:
+            self.config.update(config)
+        logger.info(f"HybridContentReconciler initialized with config: {self.config}")
+
+    def reconcile_streams(self, text_blocks: List[Dict[str, Any]], visual_elements: List[Dict[str, Any]]) -> List[ContentBlock]:
         """
-        Main reconciliation method that merges Nougat and PyMuPDF outputs.
-        
+        The core method. It takes two lists of detected elements, one for text and
+        one for visuals, and outputs a single, sorted list of ContentBlock objects.
+
         Args:
-            nougat_output: Markdown content from Nougat
-            visual_elements: List of visual elements from PyMuPDF
-            pdf_path: Path to source PDF
-            output_dir: Output directory for processed files
-            
+            text_blocks: A list of text paragraphs/headings with their page numbers and coordinates.
+                         Expected dict keys: 'type' (e.g., 'paragraph', 'heading'), 'text',
+                                             'page_num', 'bbox' ([x0,y0,x1,y1]),
+                                             'level' (for headings, optional).
+            visual_elements: A list of detected images/tables with their page numbers and coordinates.
+                             Expected dict keys: 'type' (e.g., 'image', 'table_image'), 'page_num',
+                                                 'bbox' ([x0,y0,x1,y1]), 'image_path' (for images),
+                                                 'ocr_text' (optional).
+
         Returns:
-            Unified StructuredDocument with all content properly ordered
+            A single list of ContentBlock objects, sorted in the correct reading order.
         """
-        if not STRUCTURED_MODEL_AVAILABLE:
-            raise Exception("Structured document model not available")
-            
-        self.logger.info("🔄 Starting hybrid content reconciliation...")
-        self.logger.info(f"   • Nougat content length: {len(nougat_output)} characters")
-        self.logger.info(f"   • Visual elements: {len(visual_elements)}")
+        logger.info(f"Reconciling {len(text_blocks)} text blocks with {len(visual_elements)} visual elements.")
+
+        # 1. Combine Inputs
+        all_elements_combined: List[Dict[str, Any]] = []
+        for tb in text_blocks:
+            tb_copy = tb.copy()  # Work on a copy to avoid modifying original dicts
+            tb_copy['source_stream'] = 'text'
+            all_elements_combined.append(tb_copy)
+            logger.debug(f"Added text block: {tb_copy.get('type', 'N/A')} on page {tb_copy.get('page_num', 'N/A')}")
+
+        for ve in visual_elements:
+            ve_copy = ve.copy() # Work on a copy
+            ve_copy['source_stream'] = 'visual'
+            all_elements_combined.append(ve_copy)
+            logger.debug(f"Added visual element: {ve_copy.get('type', 'N/A')} on page {ve_copy.get('page_num', 'N/A')}")
         
-        # Step 1: Parse Nougat output into structured blocks
-        nougat_blocks = self._parse_nougat_output(nougat_output)
-        self.logger.info(f"   • Parsed Nougat blocks: {len(nougat_blocks)}")
-        
-        # Step 2: Correlate visual elements with Nougat placeholders
-        correlated_content = self._correlate_visual_elements(nougat_blocks, visual_elements)
-        self.logger.info(f"   • Correlated content blocks: {len(correlated_content)}")
-        
-        # Step 3: Create unified ContentBlock objects
-        content_blocks = self._create_unified_content_blocks(correlated_content, output_dir)
-        self.logger.info(f"   • Generated content blocks: {len(content_blocks)}")
-        
-        # Step 4: Create StructuredDocument
-        document = StructuredDocument(
-            title=self._extract_document_title(nougat_blocks),
-            content_blocks=content_blocks,
-            source_filepath=pdf_path,
-            total_pages=self._estimate_total_pages(visual_elements),
-            metadata={
-                'processing_method': 'hybrid_reconciliation',
-                'nougat_blocks': len(nougat_blocks),
-                'visual_elements': len(visual_elements),
-                'image_bypass_enabled': self.image_bypass_config['bypass_all_images']
-            }
-        )
-        
-        self.logger.info(f"✅ Hybrid reconciliation completed: {document.get_statistics()}")
-        return document
-    
-    def _parse_nougat_output(self, nougat_content: str) -> List[NougatBlock]:
-        """Parse Nougat Markdown output into structured blocks"""
-        blocks = []
-        lines = nougat_content.split('\n')
-        current_page = 1
-        
-        for line_num, line in enumerate(lines):
-            line_stripped = line.strip()
-            
-            if not line_stripped:
-                continue
-                
-            # Detect page breaks
-            if re.match(r'\[MISSING_PAGE_.*?\]', line_stripped):
-                current_page += 1
-                continue
-            
-            # Detect headings
-            heading_match = re.match(r'^(#{1,6})\s+(.+)$', line_stripped)
-            if heading_match:
-                level = len(heading_match.group(1))
-                content = heading_match.group(2).strip()
-                blocks.append(NougatBlock(
-                    content_type='heading',
-                    content=content,
-                    page_num=current_page,
-                    line_number=line_num,
-                    level=level
-                ))
-                continue
-            
-            # Detect image placeholders
-            image_match = re.match(r'!\[([^\]]*)\]\(([^)]+)\)', line_stripped)
-            if image_match:
-                alt_text = image_match.group(1)
-                image_ref = image_match.group(2)
-                blocks.append(NougatBlock(
-                    content_type='image_placeholder',
-                    content=alt_text,
-                    page_num=current_page,
-                    line_number=line_num,
-                    image_reference=image_ref
-                ))
-                continue
-            
-            # Detect tables (simplified)
-            if '|' in line_stripped and line_stripped.count('|') >= 2:
-                blocks.append(NougatBlock(
-                    content_type='table',
-                    content=line_stripped,
-                    page_num=current_page,
-                    line_number=line_num
-                ))
-                continue
-            
-            # Regular paragraphs
-            if line_stripped:
-                blocks.append(NougatBlock(
-                    content_type='paragraph',
-                    content=line_stripped,
-                    page_num=current_page,
-                    line_number=line_num
-                ))
-        
-        return blocks
-    
-    def _correlate_visual_elements(self, nougat_blocks: List[NougatBlock], 
-                                 visual_elements: List[VisualElement]) -> List[Dict[str, Any]]:
-        """Correlate visual elements with Nougat placeholders"""
-        correlated_content = []
-        visual_elements_by_page = {}
-        
-        # Group visual elements by page
-        for element in visual_elements:
-            page = element.page_num
-            if page not in visual_elements_by_page:
-                visual_elements_by_page[page] = []
-            visual_elements_by_page[page].append(element)
-        
-        # Process each Nougat block
-        for block in nougat_blocks:
-            if block.content_type == 'image_placeholder':
-                # Find matching visual element
-                page_visuals = visual_elements_by_page.get(block.page_num, [])
-                matched_element = self._find_best_visual_match(block, page_visuals)
-                
-                if matched_element:
-                    correlated_content.append({
-                        'type': 'image_with_visual',
-                        'nougat_block': block,
-                        'visual_element': matched_element,
-                        'bypass_translation': self.image_bypass_config['bypass_all_images']
-                    })
-                else:
-                    # No visual match found, keep as text placeholder
-                    correlated_content.append({
-                        'type': 'image_placeholder_only',
-                        'nougat_block': block,
-                        'bypass_translation': True
-                    })
-            else:
-                # Regular content block
-                correlated_content.append({
-                    'type': 'text_content',
-                    'nougat_block': block,
-                    'bypass_translation': False
-                })
-        
-        return correlated_content
-    
-    def _find_best_visual_match(self, nougat_block: NougatBlock, 
-                               page_visuals: List[VisualElement]) -> Optional[VisualElement]:
-        """Find the best visual element match for a Nougat image placeholder"""
-        if not page_visuals:
+        logger.debug(f"Combined {len(all_elements_combined)} elements from both streams.")
+
+        # 2. Sort Combined Elements
+        # Primary key: page_num, Secondary key: bbox[1] (y-coordinate of top).
+        # Default for page_num is 0, default for bbox[1] is 0.
+        all_elements_combined.sort(key=lambda el: (
+            el.get('page_num', 0),
+            el.get('bbox', [0, 0, 0, 0])[1] if isinstance(el.get('bbox'), (list, tuple)) and len(el.get('bbox')) > 1 else 0
+        ))
+
+        logger.info(f"Sorted {len(all_elements_combined)} combined elements.")
+        if all_elements_combined:
+            logger.debug("First few elements after sorting:")
+            for i, el_sorted in enumerate(all_elements_combined[:3]):
+                 logger.debug(f"  {i+1}. Page: {el_sorted.get('page_num', 'N/A')}, Type: {el_sorted.get('type', 'N/A')}, BBox: {el_sorted.get('bbox', 'N/A')}, Source: {el_sorted.get('source_stream', 'N/A')}")
+
+
+        # 3. Convert to ContentBlocks
+        final_structure: List[ContentBlock] = []
+        for i, elem_data in enumerate(all_elements_combined):
+            # Assign a sequential block_num. This might be adjusted later if a more semantic block_num is available.
+            elem_data['block_num'] = i
+            block = self._create_block_from_element(elem_data)
+            if block:
+                final_structure.append(block)
+            # Warning for failed block creation is handled in _create_block_from_element
+
+        logger.info(f"Reconciliation complete. Unified structure created with {len(final_structure)} blocks.")
+        return final_structure
+
+    def _create_block_from_element(self, element_data: Dict[str, Any]) -> Optional[ContentBlock]:
+        """
+        A helper factory function that converts a dictionary (representing a detected element)
+        into the appropriate ContentBlock subclass.
+        """
+        elem_type = element_data.get('type', 'paragraph').lower() # Default to paragraph
+        source_stream = element_data.get('source_stream')
+        text = element_data.get('text', '')
+
+        page_num = element_data.get('page_num')
+        if page_num is None: # Check for None specifically, as 0 is a valid page number for some systems
+            logger.warning(f"Element missing 'page_num', defaulting to 0. Element: {element_data}")
+            page_num = 0
+
+        bbox_data = element_data.get('bbox')
+        if not (isinstance(bbox_data, (list, tuple)) and len(bbox_data) == 4 and all(isinstance(n, (int, float)) for n in bbox_data))):
+            logger.error(f"Invalid or missing bbox for element: {element_data}. Got: {bbox_data}. Skipping block creation.")
             return None
+        bbox = tuple(bbox_data) # Ensure it's a tuple
+
+        block_num = element_data.get('block_num', 0) # Default block_num if not set prior
         
-        # For now, return the first visual element on the page
-        # TODO: Implement spatial correlation based on line numbers and bounding boxes
-        return page_visuals[0] if page_visuals else None
+        logger.debug(f"Attempting to create ContentBlock for: type='{elem_type}', page={page_num}, bbox={bbox}, source='{source_stream}'")
+
+        if source_stream == 'visual':
+            logger.debug(f"Creating ImagePlaceholder for visual element (original type: '{elem_type}'). Path: {element_data.get('image_path', element_data.get('filepath', 'N/A'))}")
+            return ImagePlaceholder(
+                block_type=ContentType.IMAGE_PLACEHOLDER,
+                original_text=element_data.get('ocr_text', ''),
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                image_path=element_data.get('image_path', element_data.get('filepath', '')),
+                width=element_data.get('width'),
+                height=element_data.get('height'),
+                ocr_text=element_data.get('ocr_text')
+            )
+        elif elem_type == 'heading':
+            level = element_data.get('level', 1)
+            logger.debug(f"Creating Heading block (L{level}) for text element. Text: '{text[:50]}...'")
+            return Heading(
+                block_type=ContentType.HEADING,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                level=level,
+                content=text
+            )
+        elif elem_type == 'paragraph':
+            logger.debug(f"Creating Paragraph block for text element. Text: '{text[:50]}...'")
+            return Paragraph(
+                block_type=ContentType.PARAGRAPH,
+                original_text=text,
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                content=text
+            )
+        # Add more text types from text_blocks if they exist (e.g., 'list_item', 'table_text')
+        # elif elem_type == 'list_item': ...
+        # elif elem_type == 'table': # If text_blocks can represent tables as structured text
+        #     return Table(...)
+        else:
+            logger.warning(f"Unknown element type '{elem_type}' from source_stream '{source_stream}'. Treating as Paragraph. Element: {element_data}")
+            return Paragraph(
+                block_type=ContentType.PARAGRAPH,
+                original_text=text if text else f"Unknown content type: {elem_type}",
+                page_num=page_num,
+                bbox=bbox,
+                block_num=block_num,
+                content=text if text else f"Unknown content type: {elem_type}"
+            )
+
+if __name__ == '__main__':
+    # Example Usage (for testing purposes)
+    logging.basicConfig(level=logging.DEBUG)
     
-    def _create_unified_content_blocks(self, correlated_content: List[Dict[str, Any]], 
-                                     output_dir: str) -> List[ContentBlock]:
-        """Create unified ContentBlock objects from correlated content"""
-        content_blocks = []
-        block_counter = 0
-        
-        for item in correlated_content:
-            block_counter += 1
-            nougat_block = item['nougat_block']
-            
-            if item['type'] == 'image_with_visual':
-                # Create ImagePlaceholder with actual visual data
-                visual_element = item['visual_element']
-                
-                image_block = ImagePlaceholder(
-                    block_type=ContentType.IMAGE_PLACEHOLDER,
-                    original_text=nougat_block.content,
-                    page_num=nougat_block.page_num,
-                    bbox=visual_element.bbox,
-                    block_num=block_counter,
-                    image_path=visual_element.source_path,
-                    width=visual_element.width,
-                    height=visual_element.height,
-                    translation_needed=False,  # USER REQUIREMENT: No image translation
-                    caption=nougat_block.content
-                )
-                content_blocks.append(image_block)
-                
-            elif item['type'] == 'text_content':
-                # Create appropriate text content block
-                if nougat_block.content_type == 'heading':
-                    heading_block = Heading(
-                        block_type=ContentType.HEADING,
-                        original_text=nougat_block.content,
-                        page_num=nougat_block.page_num,
-                        bbox=(0, 0, 100, 20),  # Placeholder bbox
-                        block_num=block_counter,
-                        content=nougat_block.content,
-                        level=nougat_block.level or 1
-                    )
-                    content_blocks.append(heading_block)
-                    
-                elif nougat_block.content_type == 'paragraph':
-                    paragraph_block = Paragraph(
-                        block_type=ContentType.PARAGRAPH,
-                        original_text=nougat_block.content,
-                        page_num=nougat_block.page_num,
-                        bbox=(0, 0, 100, 20),  # Placeholder bbox
-                        block_num=block_counter,
-                        content=nougat_block.content
-                    )
-                    content_blocks.append(paragraph_block)
-        
-        return content_blocks
+    reconciler = HybridContentReconciler()
+
+    # Mock data (replace with actual data from Nougat/PyMuPDF/YOLO)
+    mock_text_blocks = [
+        {'type': 'heading', 'text': 'Chapter 1', 'page_num': 1, 'bbox': [50, 50, 400, 70], 'level': 1},
+        {'type': 'paragraph', 'text': 'This is the first paragraph.', 'page_num': 1, 'bbox': [50, 80, 550, 120]},
+        {'type': 'paragraph', 'text': 'Another paragraph on page 1.', 'page_num': 1, 'bbox': [50, 500, 550, 550]}, # out of order y
+    ]
+    mock_visual_elements = [
+        {'type': 'image', 'page_num': 1, 'bbox': [100, 150, 500, 450], 'image_path': 'path/to/image1.png', 'ocr_text': 'Image of a cat'},
+        {'type': 'table_image', 'page_num': 2, 'bbox': [50, 50, 550, 200], 'image_path': 'path/to/table_img.png'},
+    ]
     
-    def _extract_document_title(self, nougat_blocks: List[NougatBlock]) -> str:
-        """Extract document title from Nougat blocks"""
-        for block in nougat_blocks:
-            if block.content_type == 'heading' and block.level == 1:
-                return block.content
-        return "Untitled Document"
+    final_document_structure = reconciler.reconcile_streams(mock_text_blocks, mock_visual_elements)
     
-    def _estimate_total_pages(self, visual_elements: List[VisualElement]) -> int:
-        """Estimate total pages from visual elements"""
-        if not visual_elements:
-            return 1
-        return max(element.page_num for element in visual_elements)
+    print("\n--- Final Document Structure ---")
+    for block in final_document_structure:
+        print(f"Page {block.page_num}, Type: {block.block_type.name}, BBox: {block.bbox}, Content/Path: {getattr(block, 'content', '') or getattr(block, 'image_path', 'N/A')}")

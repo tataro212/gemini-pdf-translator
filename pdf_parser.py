@@ -1962,7 +1962,8 @@ class StructuredContentExtractor:
                     elements_in_columns[-1].append(element)
                 elif element_center_x < columns_data[0]['left']:
                      elements_in_columns[0].append(element)
-                else: # Could be an element spanning columns or in a gutter; log and assign based on proximity
+                else: # Fallback: could be an element spanning columns or in a gutter.
+                    # Log and assign to the column whose center is closest to the element's center.
                     logger.debug(f"Element {element.get('element_id', 'N/A')} at {bbox} not fitting neatly into columns. Assigning to closest.")
                     # Simplified: find closest column by center distance
                     closest_col_idx = 0
@@ -2436,12 +2437,15 @@ class StructuredContentExtractor:
             caption_candidates.sort(key=lambda x: x['confidence'], reverse=True)
             best_caption = caption_candidates[0]
 
-            return {
+            caption_details = {
                 'caption_block_id': getattr(best_caption['block'], 'block_id', None),
                 'caption_text': best_caption['text'],
                 'confidence': best_caption['confidence'],
                 'spatial_relationship': best_caption['spatial_analysis']['relationship']
             }
+            logger.debug(f"Detected caption for Image (Page {image_placeholder.page_num}, BBox {image_placeholder.bbox}): "
+                         f"'{caption_details['caption_text'][:50]}...' with confidence {caption_details['confidence']:.2f}")
+            return caption_details
 
         return None
 
@@ -2699,7 +2703,32 @@ class StructuredContentExtractor:
                 logger.debug(f"No images found for page {page_num + 1}")
 
         # Improve image placement by associating images with nearby text
-        self._associate_images_with_text_blocks(content_blocks)
+        # and linking captions directly to ImagePlaceholders.
+        # This section replaces the older _associate_images_with_text_blocks call.
+
+        logger.info("🔗 Linking captions to image placeholders...")
+        # Group content blocks by page for efficient caption linking
+        blocks_by_page = defaultdict(list)
+        for block in content_blocks:
+            blocks_by_page[block.page_num].append(block)
+
+        for page_num_key, page_blocks_list in blocks_by_page.items():
+            image_placeholders_on_page = [b for b in page_blocks_list if isinstance(b, ImagePlaceholder)]
+            # Ensure text_blocks_on_page is a list of ContentBlock, not other types
+            text_blocks_on_page = [b for b in page_blocks_list if isinstance(b, ContentBlock) and not isinstance(b, ImagePlaceholder)]
+
+            if not image_placeholders_on_page or not text_blocks_on_page:
+                continue
+
+            for image_block_instance in image_placeholders_on_page:
+                # Use existing _detect_and_link_caption logic
+                # _detect_and_link_caption expects an ImagePlaceholder and a list of text blocks
+                caption_info = self._detect_and_link_caption(image_block_instance, text_blocks_on_page)
+                if caption_info:
+                    image_block_instance.caption = caption_info['caption_text']
+                    image_block_instance.caption_block_id = caption_info['caption_block_id']
+                    logger.debug(f"Linked caption to Image: {os.path.basename(image_block_instance.image_path) if image_block_instance.image_path else 'N/A'} "
+                                 f"on page {image_block_instance.page_num}. Caption: '{caption_info['caption_text'][:50]}...'")
 
         # Create and return Document object
         document = Document(
@@ -2986,9 +3015,12 @@ class StructuredContentExtractor:
                 return True
         return False
 
-    def _associate_images_with_text_blocks(self, content_blocks):
-        """Associate images with nearby text content blocks for better placement"""
-        logger.info("🔗 Associating images with nearby text content blocks...")
+    # def _associate_images_with_text_blocks(self, content_blocks):
+    #     """
+    #     Associate images with nearby text content blocks for better placement.
+    #     This method is now superseded by direct caption linking in _extract_content_as_document.
+    #     """
+    #     logger.info("🔗 [DEPRECATED] Associating images with nearby text content blocks...")
 
         # Separate images and text content by page
         pages_content = {}
@@ -3042,9 +3074,9 @@ class StructuredContentExtractor:
 
                     logger.debug(f"Associated image {image.image_path} with text on page {page_num}")
 
-        logger.info(f"🔗 Associated {images_associated} images with text content blocks")
+        # logger.info(f"🔗 Associated {images_associated} images with text content blocks")
 
-    def _find_best_text_block_for_image(self, image_block, page_text_blocks):
+    # def _find_best_text_block_for_image(self, image_block, page_text_blocks):
         """Find the best text block to associate with an image"""
         if not page_text_blocks:
             return None
@@ -3067,9 +3099,9 @@ class StructuredContentExtractor:
             # Prefer text that's close to the image
             if distance < min_distance and distance < 200:  # Within 200 points
                 min_distance = distance
-                best_block = text_block
+                # best_block = text_block
 
-        return best_block
+        # return best_block
 
     def _extract_content_with_structure(self, doc, images_by_page, structure_analysis):
         """Extract content while preserving document structure"""

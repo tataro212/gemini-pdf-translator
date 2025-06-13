@@ -138,7 +138,7 @@ class WordDocumentGenerator:
             )
 
             # Pass 2: Generate accurate TOC with real page numbers
-            self._generate_accurate_toc(doc, structured_document, heading_page_map)
+            self._generate_toc_with_field_codes(doc, structured_document, heading_page_map) # Renamed
         else:
             # Single pass if TOC is disabled
             for block in structured_document.content_blocks:
@@ -164,122 +164,122 @@ class WordDocumentGenerator:
             logger.error(f"Attempted path: {output_filepath}")
             return None
 
-    def _add_table_of_contents_from_document(self, doc, structured_document):
-        """Add table of contents from structured document headings"""
-        try:
-            # Add TOC title with enhanced styling and sanitization
-            safe_toc_title = sanitize_for_xml(self.word_settings['toc_title'])
-            toc_title = doc.add_heading(safe_toc_title, level=1)
-            toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # def _add_table_of_contents_from_document(self, doc, structured_document):
+    #     """Add table of contents from structured document headings"""
+    #     try:
+    #         # Add TOC title with enhanced styling and sanitization
+    #         safe_toc_title = sanitize_for_xml(self.word_settings['toc_title'])
+    #         toc_title = doc.add_heading(safe_toc_title, level=1)
+    #         toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-            # Add decorative line under title
-            title_paragraph = doc.add_paragraph()
-            title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            title_run = title_paragraph.add_run("─" * 50)
-            title_run.font.color.rgb = RGBColor(128, 128, 128)
+    #         # Add decorative line under title
+    #         title_paragraph = doc.add_paragraph()
+    #         title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    #         title_run = title_paragraph.add_run("─" * 50)
+    #         title_run.font.color.rgb = RGBColor(128, 128, 128)
 
-            # Extract headings from structured document
-            headings = structured_document.get_blocks_by_type(ContentType.HEADING)
+    #         # Extract headings from structured document
+    #         headings = structured_document.get_blocks_by_type(ContentType.HEADING)
 
-            if not headings:
-                logger.warning("No headings found for table of contents")
-                return
+    #         if not headings:
+    #             logger.warning("No headings found for table of contents")
+    #             return
 
-            # Add TOC entries
-            for i, heading_block in enumerate(headings):
-                if isinstance(heading_block, Heading):
-                    self._add_toc_entry_from_heading_block(doc, heading_block, i + 1)
+    #         # Add TOC entries
+    #         for i, heading_block in enumerate(headings):
+    #             if isinstance(heading_block, Heading):
+    #                 self._add_toc_entry_from_heading_block(doc, heading_block, i + 1) # This uses estimated pages
 
-            # Add spacing after TOC
-            doc.add_paragraph()
+    #         # Add spacing after TOC
+    #         doc.add_paragraph()
 
-            logger.info(f"Table of contents added with {len(headings)} entries")
+    #         logger.info(f"Table of contents added with {len(headings)} entries")
 
-        except Exception as e:
-            logger.warning(f"Could not add table of contents: {e}")
+    #     except Exception as e:
+    #         logger.warning(f"Could not add table of contents: {e}")
 
-    def _add_toc_entry_from_heading_block(self, doc, heading_block, entry_number):
-        """Add TOC entry from a Heading content block with improved page estimation"""
-        try:
-            text = heading_block.content
-            level = heading_block.level
-            original_page_num = heading_block.page_num
+    # def _add_toc_entry_from_heading_block(self, doc, heading_block, entry_number):
+    #     """Add TOC entry from a Heading content block with improved page estimation"""
+    #     try:
+    #         text = heading_block.content
+    #         level = heading_block.level
+    #         original_page_num = heading_block.page_num
 
-            # Improved page estimation for final document
-            # Account for TOC pages, cover page, etc.
-            estimated_page = self._estimate_final_page_number(original_page_num, entry_number, level)
+    #         # Improved page estimation for final document
+    #         # Account for TOC pages, cover page, etc.
+    #         estimated_page = self._estimate_final_page_number(original_page_num, entry_number, level)
 
-            # Sanitize text for XML compatibility
-            safe_text = sanitize_for_xml(text)
+    #         # Sanitize text for XML compatibility
+    #         safe_text = sanitize_for_xml(text)
 
-            # Create TOC paragraph
-            toc_paragraph = doc.add_paragraph()
-            toc_paragraph.style = 'Normal'
+    #         # Create TOC paragraph
+    #         toc_paragraph = doc.add_paragraph()
+    #         toc_paragraph.style = 'Normal'
 
-            # Set indentation based on level
-            base_indent = 0.2
-            level_indent = (level - 1) * self.word_settings['list_indent_per_level_inches']
-            toc_paragraph.paragraph_format.left_indent = Inches(base_indent + level_indent)
+    #         # Set indentation based on level
+    #         base_indent = 0.2
+    #         level_indent = (level - 1) * self.word_settings['list_indent_per_level_inches']
+    #         toc_paragraph.paragraph_format.left_indent = Inches(base_indent + level_indent)
 
-            # Add entry number for main headings
-            if level == 1:
-                number_run = toc_paragraph.add_run(f"{entry_number}. ")
-                number_run.bold = True
-                number_run.font.color.rgb = RGBColor(0, 0, 128)  # Dark blue
+    #         # Add entry number for main headings
+    #         if level == 1:
+    #             number_run = toc_paragraph.add_run(f"{entry_number}. ")
+    #             number_run.bold = True
+    #             number_run.font.color.rgb = RGBColor(0, 0, 128)  # Dark blue
 
-            # Add heading text with hyperlink
-            try:
-                bookmark_name = f"heading_{entry_number}_{level}"
-                hyperlink_run = self._add_hyperlink(toc_paragraph, safe_text, bookmark_name)
-                if level == 1:
-                    hyperlink_run.bold = True
-                    hyperlink_run.font.size = Pt(12)
-                elif level == 2:
-                    hyperlink_run.font.size = Pt(11)
-                else:
-                    hyperlink_run.font.size = Pt(10)
-                    hyperlink_run.italic = True
-            except Exception as e:
-                logger.debug(f"Could not create hyperlink for {safe_text}: {e}")
-                # Fallback to regular text
-                text_run = toc_paragraph.add_run(safe_text)
-                if level == 1:
-                    text_run.bold = True
-                    text_run.font.size = Pt(12)
-                elif level == 2:
-                    text_run.font.size = Pt(11)
-                else:
-                    text_run.font.size = Pt(10)
-                    text_run.italic = True
+    #         # Add heading text with hyperlink
+    #         try:
+    #             bookmark_name = f"heading_{entry_number}_{level}" # This bookmark might not match the ones from _generate_content_with_page_tracking
+    #             hyperlink_run = self._add_hyperlink(toc_paragraph, safe_text, bookmark_name) # paragraph variable undefined here
+    #             if level == 1:
+    #                 hyperlink_run.bold = True
+    #                 hyperlink_run.font.size = Pt(12)
+    #             elif level == 2:
+    #                 hyperlink_run.font.size = Pt(11)
+    #             else:
+    #                 hyperlink_run.font.size = Pt(10)
+    #                 hyperlink_run.italic = True
+    #         except Exception as e:
+    #             logger.debug(f"Could not create hyperlink for {safe_text}: {e}")
+    #             # Fallback to regular text
+    #             text_run = toc_paragraph.add_run(safe_text)
+    #             if level == 1:
+    #                 text_run.bold = True
+    #                 text_run.font.size = Pt(12)
+    #             elif level == 2:
+    #                 text_run.font.size = Pt(11)
+    #             else:
+    #                 text_run.font.size = Pt(10)
+    #                 text_run.italic = True
 
-            # Add dots and page number
-            dots_needed = max(3, 60 - len(text) - len(str(estimated_page)))
-            dots_run = toc_paragraph.add_run(" " + "." * dots_needed + " ")
-            dots_run.font.color.rgb = RGBColor(128, 128, 128)
+    #         # Add dots and page number
+    #         dots_needed = max(3, 60 - len(text) - len(str(estimated_page)))
+    #         dots_run = toc_paragraph.add_run(" " + "." * dots_needed + " ")
+    #         dots_run.font.color.rgb = RGBColor(128, 128, 128)
 
-            page_run = toc_paragraph.add_run(str(estimated_page))
-            page_run.bold = True if level == 1 else False
+    #         page_run = toc_paragraph.add_run(str(estimated_page))
+    #         page_run.bold = True if level == 1 else False
 
-        except Exception as e:
-            logger.warning(f"Could not add TOC entry: {e}")
+    #     except Exception as e:
+    #         logger.warning(f"Could not add TOC entry: {e}")
 
-    def _estimate_final_page_number(self, original_page_num, entry_number, level):
-        """Estimate the final page number in the Word document accounting for TOC and cover pages"""
-        # Base estimation: original page + offset for cover page and TOC
-        toc_pages = 2  # Estimate 2 pages for TOC
-        cover_pages = 1 if self.word_settings.get('add_cover_page', False) else 0
+    # def _estimate_final_page_number(self, original_page_num, entry_number, level):
+    #     """Estimate the final page number in the Word document accounting for TOC and cover pages"""
+    #     # Base estimation: original page + offset for cover page and TOC
+    #     toc_pages = 2  # Estimate 2 pages for TOC
+    #     cover_pages = 1 if self.word_settings.get('add_cover_page', False) else 0
 
-        # Calculate offset
-        page_offset = cover_pages + toc_pages
+    #     # Calculate offset
+    #     page_offset = cover_pages + toc_pages
 
-        # For the first few headings, use a more conservative estimation
-        if entry_number <= 3:
-            estimated_page = page_offset + entry_number
-        else:
-            # Use original page number with offset
-            estimated_page = max(original_page_num + page_offset, page_offset + entry_number)
+    #     # For the first few headings, use a more conservative estimation
+    #     if entry_number <= 3:
+    #         estimated_page = page_offset + entry_number
+    #     else:
+    #         # Use original page number with offset
+    #         estimated_page = max(original_page_num + page_offset, page_offset + entry_number)
 
-        return estimated_page
+    #     return estimated_page
 
     def _generate_content_with_page_tracking(self, doc, structured_document, image_folder_path):
         """
@@ -294,7 +294,8 @@ class WordDocumentGenerator:
         heading_counter = 0
 
         # Reserve space for TOC (we'll insert it later)
-        toc_placeholder = doc.add_paragraph("[TABLE OF CONTENTS PLACEHOLDER]")
+        # Updated placeholder text for clarity
+        toc_placeholder = doc.add_paragraph("[TOC_PLACEHOLDER_FOR_FIELD_CODES]")
         toc_placeholder.style = 'Normal'
         doc.add_page_break()
 
@@ -336,100 +337,154 @@ class WordDocumentGenerator:
         logger.info(f"✅ Pass 1 complete: Tracked {len(heading_page_map)} headings")
         return heading_page_map
 
-    def _generate_accurate_toc(self, doc, structured_document, heading_page_map):
+    def _generate_toc_with_field_codes(self, doc, structured_document, heading_page_map): # Renamed from _generate_accurate_toc
         """
-        Proposition 2: Pass 2 - Generate accurate TOC with real page numbers.
+        Pass 2: Generate TOC with Word field codes for page numbers.
 
         Navigates to the beginning of the document and replaces the placeholder
         with an accurate TOC using the collected page numbers.
         """
-        logger.info("🔄 Pass 2: Generating accurate TOC with real page numbers...")
+        logger.info("🔄 Pass 2: Generating TOC with Word field codes...")
 
         try:
             # Find and replace the TOC placeholder
-            for paragraph in doc.paragraphs:
-                if "[TABLE OF CONTENTS PLACEHOLDER]" in paragraph.text:
-                    # Clear the placeholder
-                    paragraph.clear()
+            for p_idx, paragraph in enumerate(doc.paragraphs):
+                if "[TOC_PLACEHOLDER_FOR_FIELD_CODES]" in paragraph.text:
+                    # Clear the placeholder paragraph's content
+                    for run in paragraph.runs:
+                        run.clear()
+                    # If the placeholder was the only content, the paragraph itself might be removed or reused.
+                    # It's safer to clear its runs and then add new content to it,
+                    # or insert new paragraphs after it and then delete it.
+
+                    # For simplicity, we'll reuse this paragraph for the ToC title.
+                    # If it's not the first paragraph, one might want to insert new ones before it.
+
+                    toc_start_paragraph = paragraph
 
                     # Add TOC title
                     safe_toc_title = sanitize_for_xml(self.word_settings['toc_title'])
-                    toc_title_paragraph = paragraph
-                    toc_title_run = toc_title_paragraph.add_run(safe_toc_title)
+                    toc_title_run = toc_start_paragraph.add_run(safe_toc_title)
                     toc_title_run.bold = True
                     toc_title_run.font.size = Pt(16)
-                    toc_title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    toc_start_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-                    # Add decorative line
-                    decorative_paragraph = self._insert_paragraph_after(doc, toc_title_paragraph)
-                    decorative_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    decorative_run = decorative_paragraph.add_run("─" * 50)
-                    decorative_run.font.color.rgb = RGBColor(128, 128, 128)
+                    # Add decorative line (optional)
+                    # decorative_paragraph = doc.add_paragraph() # Add new paragraph for line
+                    # decorative_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    # decorative_run = decorative_paragraph.add_run("─" * 50)
+                    # decorative_run.font.color.rgb = RGBColor(128, 128, 128)
 
-                    # Add TOC entries with accurate page numbers
-                    last_paragraph = decorative_paragraph
-
-                    # Sort headings by their order in the document
+                    # Add TOC entries with field codes
                     sorted_headings = sorted(
                         heading_page_map.values(),
                         key=lambda x: x['heading_number']
                     )
 
                     for heading_info in sorted_headings:
-                        toc_entry_paragraph = self._insert_paragraph_after(doc, last_paragraph)
-                        self._add_accurate_toc_entry(toc_entry_paragraph, heading_info)
-                        last_paragraph = toc_entry_paragraph
+                        # Each ToC entry is a new paragraph
+                        toc_entry_paragraph = doc.add_paragraph()
+                        self._add_toc_entry_with_field_code(toc_entry_paragraph, heading_info)
 
-                    # Add spacing after TOC
-                    spacing_paragraph = self._insert_paragraph_after(doc, last_paragraph)
-                    spacing_paragraph.add_run("")  # Empty paragraph for spacing
+                    # If the original placeholder paragraph is now empty (if title was added to a new one)
+                    # and it's not the one used for the title, it could be removed.
+                    # However, reusing it for the title is cleaner.
+                    # If new paragraphs were inserted *before* it, it would be pushed down.
+                    # If we add all ToC entries as new paragraphs, the original placeholder (if cleared and not used)
+                    # might remain as an empty paragraph unless explicitly removed.
+                    # Current approach: reuse placeholder for title, then add_paragraph for entries.
 
-                    logger.info(f"✅ Pass 2 complete: Generated accurate TOC with {len(sorted_headings)} entries")
-                    break
-            else:
-                logger.warning("TOC placeholder not found, adding TOC at the beginning")
-                # Fallback: add TOC at the beginning
-                self._add_fallback_toc(doc, heading_page_map)
+                    logger.info(f"✅ Pass 2 complete: Generated TOC with field codes for {len(sorted_headings)} entries.")
+                    return # TOC generated, exit the method.
+
+            logger.warning("TOC placeholder '[TOC_PLACEHOLDER_FOR_FIELD_CODES]' not found. TOC will not be generated with field codes.")
 
         except Exception as e:
-            logger.error(f"Error generating accurate TOC: {e}")
-            # Fallback to original method
-            self._add_table_of_contents_from_document(doc, structured_document)
+            logger.error(f"Error generating TOC with field codes: {e}")
+            # Fallback to old method if something goes wrong (optional, or just log error)
+            # self._add_table_of_contents_from_document(doc, structured_document) # This itself uses estimated pages
+            logger.warning("Old fallback _add_table_of_contents_from_document call commented out during PAGEREF refactor.")
 
-    def _calculate_current_page_number(self, doc, heading_counter):
+
+    def _add_pageref_field(self, paragraph, bookmark_name: str, placeholder_text: str = "#"):
+        """
+        Adds a PAGEREF field code to the given paragraph.
+        """
+        run = paragraph.add_run()
+        fldSimple = OxmlElement('w:fldSimple')
+        fldSimple.set(qn('w:instr'), f' PAGEREF {bookmark_name} \\h ')
+
+        # Add a run with placeholder text for the field code
+        # This text will be replaced by Word when fields are updated.
+        fldText = OxmlElement('w:r')
+        t = OxmlElement('w:t')
+        t.text = placeholder_text
+        fldText.append(t)
+        fldSimple.append(fldText)
+
+        run._r.append(fldSimple)
+
+    def _add_toc_entry_with_field_code(self, paragraph, heading_info):
+        """Add a TOC entry using PAGEREF field code for the page number."""
+        try:
+            text = heading_info['text']
+            level = heading_info['level']
+            bookmark_name = heading_info['bookmark_name']
+            # heading_number = heading_info['heading_number'] # Not used for display directly with field codes
+
+            # Set indentation based on level
+            base_indent = self.word_settings.get('toc_indent_level_1_inches', 0.2)
+            indent_per_level = self.word_settings.get('toc_indent_per_level_inches', 0.2)
+            paragraph.paragraph_format.left_indent = Inches(base_indent + (level - 1) * indent_per_level)
+
+            # Add heading text (optionally as hyperlink)
+            # For simplicity, not making it a hyperlink first, can be added back.
+            text_run = paragraph.add_run(sanitize_for_xml(text))
+            # Example styling (can be configured)
+            if level == 1:
+                text_run.bold = True
+                text_run.font.size = Pt(12)
+            elif level == 2:
+                text_run.font.size = Pt(11)
+            else:
+                text_run.font.size = Pt(10)
+                # text_run.italic = True # Optional
+
+            # Add a tab to align page numbers to the right
+            # This requires setting a right-aligned tab stop in the paragraph's style or directly.
+            # For now, just adding a tab character. Actual alignment needs style definition.
+            tab_run = paragraph.add_run('\t')
+
+            # Add PAGEREF field for the page number
+            self._add_pageref_field(paragraph, bookmark_name, placeholder_text="0") # "0" or "#" as placeholder
+
+        except Exception as e:
+            logger.warning(f"Could not add TOC field code entry for '{heading_info.get('text','N/A')}': {e}")
+
+
+    def _calculate_current_page_number(self, doc, heading_counter): # This method might be deprecated or simplified for ToC
         """
         Calculate approximate current page number based on document content.
-
-        This is a more sophisticated estimation that considers:
-        - Number of paragraphs added so far
-        - Average lines per page
-        - Content density
+        NOTE: With PAGEREF fields, this estimation is not directly used for ToC page numbers,
+        but might be useful for other metadata or debugging.
         """
-        # Count total paragraphs and content so far
         total_paragraphs = len(doc.paragraphs)
-
-        # Estimate based on content density
-        # Assume ~25-30 lines per page, ~2-3 paragraphs per page for typical content
         estimated_lines_per_page = 28
         estimated_paragraphs_per_page = 2.5
-
-        # Calculate page based on paragraph count
         page_from_paragraphs = max(1, int(total_paragraphs / estimated_paragraphs_per_page))
 
-        # Add offset for cover page and TOC space
-        toc_pages = 2
+        toc_pages = 1 # Simplified: Assume ToC takes at least 1 page before content.
         cover_pages = 1 if self.word_settings.get('add_cover_page', False) else 0
         page_offset = cover_pages + toc_pages
 
         estimated_page = page_from_paragraphs + page_offset
+        if heading_counter > 1: # Ensure page numbers generally increase
+            estimated_page = max(estimated_page, page_offset + (heading_counter // 5)) # Rough estimate
 
-        # Ensure logical progression (each heading should be on same or later page)
-        if heading_counter > 1:
-            estimated_page = max(estimated_page, page_offset + heading_counter)
-
+        logger.debug(f"Estimated page for heading {heading_counter}: {estimated_page} (total_paras: {total_paragraphs})")
         return estimated_page
 
-    def _insert_paragraph_after(self, doc, reference_paragraph):
+    def _insert_paragraph_after(self, doc, reference_paragraph): # May not be needed if adding directly
         """Insert a new paragraph after the reference paragraph"""
         # Find the reference paragraph in the document
         for i, paragraph in enumerate(doc.paragraphs):
@@ -443,80 +498,31 @@ class WordDocumentGenerator:
         # Fallback: add at end
         return doc.add_paragraph()
 
-    def _add_accurate_toc_entry(self, paragraph, heading_info):
-        """Add a TOC entry with accurate page number and hyperlink"""
-        try:
-            text = heading_info['text']
-            level = heading_info['level']
-            page_number = heading_info['page_number']
-            bookmark_name = heading_info['bookmark_name']
-            heading_number = heading_info['heading_number']
+    # def _add_accurate_toc_entry(self, paragraph, heading_info):
+    #     """Add a TOC entry with accurate page number and hyperlink"""
+    #     # This method is replaced by _add_toc_entry_with_field_code
+    #     # Keeping it commented for reference during transition if needed
+    #     pass
 
-            # Set indentation based on level
-            base_indent = 0.2
-            level_indent = (level - 1) * self.word_settings['list_indent_per_level_inches']
-            paragraph.paragraph_format.left_indent = Inches(base_indent + level_indent)
 
-            # Add entry number for main headings
-            if level == 1:
-                number_run = paragraph.add_run(f"{heading_number}. ")
-                number_run.bold = True
-                number_run.font.color.rgb = RGBColor(0, 0, 128)  # Dark blue
-
-            # Add heading text with hyperlink
-            try:
-                hyperlink_run = self._add_hyperlink(paragraph, text, bookmark_name)
-                if level == 1:
-                    hyperlink_run.bold = True
-                    hyperlink_run.font.size = Pt(12)
-                elif level == 2:
-                    hyperlink_run.font.size = Pt(11)
-                else:
-                    hyperlink_run.font.size = Pt(10)
-                    hyperlink_run.italic = True
-            except Exception as e:
-                logger.debug(f"Could not create hyperlink for {text}: {e}")
-                # Fallback to regular text
-                text_run = paragraph.add_run(text)
-                if level == 1:
-                    text_run.bold = True
-                    text_run.font.size = Pt(12)
-                elif level == 2:
-                    text_run.font.size = Pt(11)
-                else:
-                    text_run.font.size = Pt(10)
-                    text_run.italic = True
-
-            # Add dots and accurate page number
-            dots_needed = max(3, 60 - len(text) - len(str(page_number)))
-            dots_run = paragraph.add_run(" " + "." * dots_needed + " ")
-            dots_run.font.color.rgb = RGBColor(128, 128, 128)
-
-            page_run = paragraph.add_run(str(page_number))
-            page_run.bold = True if level == 1 else False
-
-        except Exception as e:
-            logger.warning(f"Could not add accurate TOC entry: {e}")
-
-    def _add_fallback_toc(self, doc, heading_page_map):
-        """Fallback method to add TOC if placeholder method fails"""
-        logger.info("Using fallback TOC generation method")
-
-        # Insert TOC at the beginning (after title if present)
-        first_paragraph = doc.paragraphs[0] if doc.paragraphs else doc.add_paragraph()
-
-        # Add TOC title
-        toc_title = doc.add_heading(self.word_settings['toc_title'], level=1)
-        toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        # Add entries
-        sorted_headings = sorted(heading_page_map.values(), key=lambda x: x['heading_number'])
-        for heading_info in sorted_headings:
-            toc_paragraph = doc.add_paragraph()
-            self._add_accurate_toc_entry(toc_paragraph, heading_info)
-
-        # Add page break
-        doc.add_page_break()
+    # def _add_fallback_toc(self, doc, heading_page_map):
+    #     """Fallback method to add TOC if placeholder method fails"""
+    #     # This method relied on _add_accurate_toc_entry which used estimated pages.
+    #     # For a field-code based TOC, a fallback would be more complex or might just be omitted.
+    #     logger.warning("Old fallback _add_fallback_toc call commented out during PAGEREF refactor.")
+    #     # logger.info("Using fallback TOC generation method")
+    #     # # Insert TOC at the beginning (after title if present)
+    #     # first_paragraph = doc.paragraphs[0] if doc.paragraphs else doc.add_paragraph()
+    #     # # Add TOC title
+    #     # toc_title = doc.add_heading(self.word_settings['toc_title'], level=1)
+    #     # toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    #     # # Add entries
+    #     # sorted_headings = sorted(heading_page_map.values(), key=lambda x: x['heading_number'])
+    #     # for heading_info in sorted_headings:
+    #     #     toc_paragraph = doc.add_paragraph()
+    #     #     self._add_accurate_toc_entry(toc_paragraph, heading_info) # This would need to use field codes too
+    #     # # Add page break
+    #     # doc.add_page_break()
 
     def _add_content_block(self, doc, block, image_folder_path):
         """Add a content block to the document using isinstance for type-specific rendering"""
@@ -1455,123 +1461,77 @@ class PDFConverter:
             logger.info("   - Check Windows updates")
             logger.info("   - Try restarting the system")
 
-class PageEstimator:
-    """Accurate page estimation for TOC generation"""
+# class PageEstimator: # Commenting out as it's likely obsolete for field-code ToC
+#     """Accurate page estimation for TOC generation"""
 
-    def __init__(self):
-        # Page layout constants (based on typical Word document)
-        self.lines_per_page = 25  # More conservative estimate for realistic pagination
-        self.chars_per_line = 70  # Realistic character count per line
-        self.words_per_line = 10  # Realistic word count per line
+#     def __init__(self):
+#         # Page layout constants (based on typical Word document)
+#         self.lines_per_page = 25
+#         self.chars_per_line = 70
+#         self.words_per_line = 10
 
-        # Current tracking
-        self.current_page = 1
-        self.current_line = 0
-        self.total_content_processed = 0
+#         # Current tracking
+#         self.current_page = 1
+#         self.current_line = 0
+#         self.total_content_processed = 0
 
-        # Content type weights (how much space different content types take)
-        self.content_weights = {
-            'h1': 4.0,  # Headings take more space due to formatting and spacing
-            'h2': 3.0,
-            'h3': 2.5,
-            'paragraph': 1.0,
-            'list_item': 1.3,
-            'image': 12.0,  # Images take significant space including captions
-        }
+#         # Content type weights
+#         self.content_weights = {
+#             'h1': 4.0, 'h2': 3.0, 'h3': 2.5,
+#             'paragraph': 1.0, 'list_item': 1.3, 'image': 12.0,
+#         }
+#         self.content_history = []
 
-        # Track content distribution for better estimation
-        self.content_history = []
+#     def process_item(self, item):
+#         item_type = item.get('type', 'paragraph')
+#         text = item.get('text', '')
+#         content_size = self._calculate_content_size(item_type, text)
+#         self._update_position(content_size, item_type)
+#         self.content_history.append({
+#             'type': item_type, 'size': content_size,
+#             'page': self.current_page, 'line': self.current_line
+#         })
+#         self.total_content_processed += 1
 
-    def process_item(self, item):
-        """Process a content item and update page estimation"""
-        item_type = item.get('type', 'paragraph')
-        text = item.get('text', '')
+#     def _calculate_content_size(self, item_type, text):
+#         base_weight = self.content_weights.get(item_type, 1.0)
+#         if item_type == 'image': return base_weight
+#         text_length = len(text) if text else 0
+#         if text_length == 0: return 0.5
+#         estimated_lines = max(1, text_length / self.chars_per_line)
+#         return estimated_lines * base_weight
 
-        # Calculate content size
-        content_size = self._calculate_content_size(item_type, text)
+#     def _update_position(self, content_size, item_type):
+#         self.current_line += content_size
+#         if item_type in ['h1', 'h2', 'h3']: self.current_line += 1.5
+#         elif item_type == 'image': self.current_line += 2.0
+#         while self.current_line >= self.lines_per_page:
+#             self.current_page += 1
+#             self.current_line -= self.lines_per_page
 
-        # Update position tracking
-        self._update_position(content_size, item_type)
+#     def get_current_page(self):
+#         return max(1, self.current_page)
 
-        # Store for analysis
-        self.content_history.append({
-            'type': item_type,
-            'size': content_size,
-            'page': self.current_page,
-            'line': self.current_line
-        })
+#     def get_position_info(self):
+#         return {
+#             'page': self.current_page, 'line': self.current_line,
+#             'total_items': self.total_content_processed
+#         }
 
-        self.total_content_processed += 1
-
-    def _calculate_content_size(self, item_type, text):
-        """Calculate how much space content will take"""
-        base_weight = self.content_weights.get(item_type, 1.0)
-
-        if item_type == 'image':
-            # Images have fixed size impact
-            return base_weight
-
-        # For text content, calculate based on length
-        text_length = len(text) if text else 0
-
-        if text_length == 0:
-            return 0.5  # Empty items still take some space
-
-        # Estimate lines needed
-        estimated_lines = max(1, text_length / self.chars_per_line)
-
-        # Apply content type weight
-        weighted_lines = estimated_lines * base_weight
-
-        return weighted_lines
-
-    def _update_position(self, content_size, item_type):
-        """Update current page and line position"""
-        # Add content size to current line count
-        self.current_line += content_size
-
-        # Add extra spacing for certain content types
-        if item_type in ['h1', 'h2', 'h3']:
-            self.current_line += 1.5  # Extra spacing around headings
-        elif item_type == 'image':
-            self.current_line += 2.0  # Extra spacing around images
-
-        # Check if we need to move to next page
-        while self.current_line >= self.lines_per_page:
-            self.current_page += 1
-            self.current_line -= self.lines_per_page
-
-    def get_current_page(self):
-        """Get current estimated page number"""
-        return max(1, self.current_page)
-
-    def get_position_info(self):
-        """Get detailed position information"""
-        return {
-            'page': self.current_page,
-            'line': self.current_line,
-            'total_items': self.total_content_processed
-        }
-
-    def get_estimation_stats(self):
-        """Get statistics about the estimation process"""
-        if not self.content_history:
-            return {}
-
-        total_pages = self.current_page
-        items_per_page = self.total_content_processed / max(1, total_pages)
-
-        content_type_distribution = {}
-        for item in self.content_history:
-            item_type = item['type']
-            content_type_distribution[item_type] = content_type_distribution.get(item_type, 0) + 1
-
-        return {
-            'total_pages_estimated': total_pages,
-            'total_items_processed': self.total_content_processed,
-            'average_items_per_page': items_per_page,
-            'content_distribution': content_type_distribution
-        }
+#     def get_estimation_stats(self):
+#         if not self.content_history: return {}
+#         total_pages = self.current_page
+#         items_per_page = self.total_content_processed / max(1, total_pages)
+#         content_type_distribution = {}
+#         for item in self.content_history:
+#             item_type = item['type']
+#             content_type_distribution[item_type] = content_type_distribution.get(item_type, 0) + 1
+#         return {
+#             'total_pages_estimated': total_pages,
+#             'total_items_processed': self.total_content_processed,
+#             'average_items_per_page': items_per_page,
+#             'content_distribution': content_type_distribution
+#         }
 
 # Global instances
 document_generator = WordDocumentGenerator()

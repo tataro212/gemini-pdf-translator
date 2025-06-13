@@ -1099,64 +1099,48 @@ class UltimatePDFTranslator:
             logger.info("📄 Step 2: Extracting cover page...")
             cover_page_data = self.pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
             
-            # Step 3: Extract structured content
-            logger.info("📝 Step 3: Extracting structured content...")
+            # Step 3: Extract structured content as Document object
+            logger.info("📝 Step 3: Extracting structured document...")
             document = self.content_extractor.extract_structured_content_from_pdf(
                 filepath, extracted_images
             )
 
             if not document or not document.content_blocks:
                 raise Exception("No content could be extracted from the PDF")
+            logger.info(f"📊 Extracted document: {document.get_statistics()}")
 
-            # Convert Document to legacy format for standard workflow
-            from structured_document_model import convert_document_to_legacy_format
-            structured_content = convert_document_to_legacy_format(document)
-            logger.info(f"📋 Converted Document to legacy format: {len(structured_content)} items")
-            logger.debug(f"📋 Legacy content type: {type(structured_content)}")
-            if structured_content and len(structured_content) > 0:
-                logger.debug(f"📋 First item type: {type(structured_content[0])}")
-                logger.debug(f"📋 First item: {structured_content[0]}")
-            else:
-                logger.warning("📋 No content in legacy format!")
-
-            # Step 3.5: Restructure text to separate footnotes
-            logger.info("🔧 Step 3.5: Restructuring text and separating footnotes...")
-            structured_content = self._restructure_content_text(structured_content)
+            # Step 3.5: Restructure text to separate footnotes (TODO: Adapt for StructuredDocument)
+            # logger.info("🔧 Step 3.5: Restructuring text and separating footnotes...")
+            # For now, we skip direct modification of 'document'.
+            # If DocumentTextRestructurer is adapted, it should work on 'document.content_blocks'
+            # or 'document' itself.
+            # structured_content = self._restructure_content_text(structured_content) # This line worked on legacy
             
-            # Step 4: Analyze images for translation
+            # Step 4: Analyze images for translation (integrate with Document)
             logger.info("🔍 Step 4: Analyzing images...")
             if extracted_images:
                 image_paths = [img['filepath'] for img in extracted_images]
                 image_analysis = self.image_analyzer.batch_analyze_images(image_paths)
-                
-                # Add OCR text to image items in structured content
-                self._integrate_image_analysis(structured_content, image_analysis)
+                # Use the method designed for Document objects
+                self._integrate_image_analysis_into_document(document, image_analysis)
             
-            # Step 5: Optimize content for translation
-            logger.info("⚡ Step 5: Optimizing content...")
+            # Step 5 & 6: Translate the structured document
+            logger.info("🌐 Step 5 & 6: Translating structured document...")
             target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
             
-            # Filter out image items for optimization (they don't need translation)
-            text_items = [item for item in structured_content if item.get('type') != 'image']
-            
-            optimized_batches, optimization_params = optimization_manager.optimize_content_for_translation(
-                text_items, target_language
+            # Use the translation_service.translate_document method which handles StructuredDocument
+            translated_document = await translation_service.translate_document(
+                document, target_language, precomputed_style_guide or ""
             )
             
-            # Step 6: Translate content
-            logger.info("🌐 Step 6: Translating content...")
-            translated_content = await self._translate_batches(
-                optimized_batches, target_language, precomputed_style_guide
-            )
+            # Step 7: (Reconstruction is handled by translate_document)
+            logger.info("🔧 Step 7: Document reconstruction handled by translation service.")
             
-            # Step 7: Reconstruct full content with images
-            logger.info("🔧 Step 7: Reconstructing document...")
-            final_content = self._reconstruct_full_content(structured_content, translated_content)
-            
-            # Step 8: Generate Word document
+            # Step 8: Generate Word document from structured document
             logger.info("📄 Step 8: Generating Word document...")
-            saved_word_filepath = document_generator.create_word_document_with_structure(
-                final_content, word_output_path, image_folder, cover_page_data
+            # Use the method designed for Document objects
+            saved_word_filepath = document_generator.create_word_document_from_structured_document(
+                translated_document, word_output_path, image_folder, cover_page_data
             )
 
             if not saved_word_filepath:
@@ -1188,21 +1172,22 @@ class UltimatePDFTranslator:
 
                 drive_results = drive_uploader.upload_multiple_files(files_to_upload)
             
-            # Step 11: Generate final report
+            # Step 11: Generate final report (using structured report)
             end_time = time.time()
-            self._generate_final_report(
+            # Use the report generator that works with Document objects
+            self._generate_structured_final_report(
                 filepath, output_dir_for_this_file, start_time, end_time,
-                len(structured_content), len(translated_content), drive_results, pdf_success
+                document, translated_document, drive_results, pdf_success
             )
             
             # Save translation cache
             translation_service.save_caches()
             
-            logger.info("✅ Translation workflow completed successfully!")
+            logger.info("✅ Standard workflow (using StructuredDocument) completed successfully!")
             return precomputed_style_guide  # Return for potential reuse in batch processing
             
         except Exception as e:
-            logger.error(f"❌ Translation workflow failed: {e}")
+            logger.error(f"❌ Standard workflow (using StructuredDocument) failed: {e}")
             raise
 
     async def _translate_document_structured(self, filepath, output_dir_for_this_file,
@@ -1242,34 +1227,91 @@ class UltimatePDFTranslator:
             logger.info("📄 Step 2: Extracting cover page...")
             cover_page_data = self.pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
 
-            # Step 3: Extract structured content as Document object
-            logger.info("📝 Step 3: Extracting structured document...")
-            document = self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
+            # Import HybridContentReconciler at the top of the file
+            # from hybrid_content_reconciler import HybridContentReconciler
 
-            if not document or not document.content_blocks:
-                raise Exception("No content could be extracted from the PDF")
+            # Step 3: Instantiate Reconciler
+            reconciler = HybridContentReconciler()
 
-            logger.info(f"📊 Extracted document: {document.get_statistics()}")
+            # Step 3a: Prepare visual_elements stream
+            logger.info("🖼️ Preparing visual elements stream for reconciler...")
+            prepared_visual_elements = []
+            if extracted_images: # extracted_images is from Step 1
+                for img_ref in extracted_images:
+                    prepared_visual_elements.append({
+                        'type': img_ref.get('type', 'image'), # Assuming img_ref might have a 'type' key
+                        'page_num': img_ref['page_num'],
+                        'bbox': [img_ref['x0'], img_ref['y0'], img_ref['x1'], img_ref['y1']],
+                        'image_path': img_ref['filepath'],
+                        'width': img_ref.get('width'),
+                        'height': img_ref.get('height'),
+                        'ocr_text': img_ref.get('ocr_text')
+                    })
+            logger.info(f"Prepared {len(prepared_visual_elements)} visual elements.")
 
-            # Step 4: Analyze images for translation (integrate with Document)
-            logger.info("🔍 Step 4: Analyzing images...")
-            if extracted_images:
+            # Step 3b: Simulate text_blocks stream from PyMuPDF extraction (ContentExtractor)
+            # TODO: Replace this with actual Nougat output processing in a future task.
+            #       Nougat output should be parsed into a list of dictionaries,
+            #       each representing a text block (heading, paragraph) with 'type',
+            #       'text', 'page_num', 'bbox', and 'level' (for headings).
+            logger.info("📝 Simulating text_blocks stream using PyMuPDF output for reconciliation...")
+            initial_document = self.content_extractor.extract_structured_content_from_pdf(filepath, []) # Empty list for images
+
+            simulated_text_blocks = []
+            if initial_document and initial_document.content_blocks:
+                for block in initial_document.content_blocks:
+                    if not isinstance(block, ImagePlaceholder): # Exclude images from this stream
+                        block_dict = {
+                            'type': block.block_type.value if hasattr(block.block_type, 'value') else str(block.block_type),
+                            'text': getattr(block, 'content', getattr(block, 'original_text', '')),
+                            'page_num': block.page_num,
+                            'bbox': list(block.bbox)
+                        }
+                        if hasattr(block, 'level'):
+                            block_dict['level'] = block.level
+                        simulated_text_blocks.append(block_dict)
+            logger.info(f"Simulated {len(simulated_text_blocks)} text blocks for reconciliation.")
+
+            # Step 3c: Call Reconciler
+            logger.info("🔄 Reconciling text and visual streams...")
+            reconciled_content_blocks = reconciler.reconcile_streams(simulated_text_blocks, prepared_visual_elements)
+            logger.info(f"Reconciliation resulted in {len(reconciled_content_blocks)} content blocks.")
+
+            # Step 3d: Create/Update StructuredDocument
+            # Use a consistent title, perhaps from initial_document or generate one
+            doc_title = initial_document.title if initial_document else os.path.splitext(os.path.basename(filepath))[0]
+            total_pages = initial_document.total_pages if initial_document else 0 # Get total_pages from initial parse
+
+            reconciled_document = StructuredDocument(
+                title=doc_title,
+                content_blocks=reconciled_content_blocks,
+                source_filepath=filepath,
+                total_pages=total_pages, # Use total_pages from initial PyMuPDF parse
+                metadata={'processing_method': 'hybrid_reconciliation_v1'}
+            )
+            logger.info(f"📊 Reconciled document: {reconciled_document.get_statistics()}")
+
+            # Step 4: Analyze images for translation (integrate with Reconciled Document)
+            # This step might be redundant if ocr_text is already part of prepared_visual_elements
+            # and ImagePlaceholders are created with it. However, keeping it if SmartImageAnalyzer does more.
+            logger.info("🔍 Step 4: Analyzing images in reconciled document...")
+            if extracted_images: # Use the original extracted_images list for analysis
                 image_paths = [img['filepath'] for img in extracted_images]
                 image_analysis = self.image_analyzer.batch_analyze_images(image_paths)
-                self._integrate_image_analysis_into_document(document, image_analysis)
+                self._integrate_image_analysis_into_document(reconciled_document, image_analysis)
 
-            # Step 5: Translate the structured document
-            logger.info("🌐 Step 5: Translating structured document...")
+            # Step 5: Translate the reconciled structured document
+            logger.info("🌐 Step 5: Translating reconciled structured document...")
             target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
 
-            translated_document = await translation_service.translate_document(
-                document, target_language, precomputed_style_guide or ""
+            translated_reconciled_document = await translation_service.translate_document(
+                reconciled_document, target_language, precomputed_style_guide or ""
             )
 
             # Step 6: Generate Word document from structured document
             logger.info("📄 Step 6: Generating Word document...")
             saved_word_filepath = document_generator.create_word_document_from_structured_document(
-                translated_document, word_output_path, image_folder, cover_page_data
+                translated_reconciled_document, word_output_path, image_folder, cover_page_data
             )
 
             if not saved_word_filepath:
@@ -1303,13 +1345,13 @@ class UltimatePDFTranslator:
             end_time = time.time()
             self._generate_structured_final_report(
                 filepath, output_dir_for_this_file, start_time, end_time,
-                document, translated_document, drive_results, pdf_success
+                reconciled_document, translated_reconciled_document, drive_results, pdf_success # Use reconciled documents
             )
 
             # Save translation cache
             translation_service.save_caches()
 
-            logger.info("✅ Structured document translation completed successfully!")
+            logger.info("✅ Structured document translation (with Hybrid Reconciler) completed successfully!")
             return precomputed_style_guide
 
         except Exception as e:
@@ -1362,12 +1404,14 @@ class UltimatePDFTranslator:
 
         except ImportError:
             logger.error("❌ Final Assembly Pipeline not available - falling back to standard structured approach")
-            return await self.translate_pdf_structured_document_model(filepath, output_dir, target_language_override, precomputed_style_guide, cover_page_data)
+            # Fallback to structured document model workflow
+            return await self._translate_document_structured(filepath, output_dir, target_language_override, precomputed_style_guide)
 
         except Exception as e:
             logger.error(f"❌ Final Assembly Translation failed: {e}")
             logger.info("🔄 Falling back to standard structured approach...")
-            return await self.translate_pdf_structured_document_model(filepath, output_dir, target_language_override, precomputed_style_guide, cover_page_data)
+            # Fallback to structured document model workflow
+            return await self._translate_document_structured(filepath, output_dir, target_language_override, precomputed_style_guide)
 
     def _integrate_image_analysis_into_document(self, document, image_analysis):
         """Integrate image analysis results into Document object"""
