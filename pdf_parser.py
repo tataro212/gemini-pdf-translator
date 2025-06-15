@@ -1025,9 +1025,9 @@ class PDFParser:
                 area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
                 area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
 
-                # If there's significant overlap (>30%), they're competing extractions
+                # If there's significant overlap (>20%), they're competing extractions
                 min_area = min(area1, area2)
-                if min_area > 0 and overlap_area > 0.3 * min_area:
+                if min_area > 0 and overlap_area > 0.2 * min_area:
                     return True
 
             # Check file size similarity for potential competing extractions
@@ -1038,8 +1038,15 @@ class PDFParser:
                 # If one is much larger, they might be competing versions
                 # (good extraction vs text-only extraction)
                 size_ratio = max(size1, size2) / max(min(size1, size2), 1)
-                if size_ratio > 5:  # One is 5x larger - likely competing extractions
+                if size_ratio > 3:  # One is 3x larger - likely competing extractions
                     return True
+
+                # Check if they have similar dimensions
+                if 'width' in img1 and 'height' in img1 and 'width' in img2 and 'height' in img2:
+                    width_ratio = max(img1['width'], img2['width']) / max(min(img1['width'], img2['width']), 1)
+                    height_ratio = max(img1['height'], img2['height']) / max(min(img1['height'], img2['height']), 1)
+                    if width_ratio < 1.2 and height_ratio < 1.2:  # Very similar dimensions
+                        return True
 
         except Exception as e:
             logger.debug(f"Error checking image similarity: {e}")
@@ -3654,3 +3661,33 @@ class StructuredContentExtractor:
 
         logger.info(f"Enhanced TOC extraction found {len(unique_entries)} unique entries")
         return unique_entries
+
+    def _is_likely_page_number(self, text):
+        """Check if text is likely a page number"""
+        text = text.strip()
+        
+        # Skip empty text
+        if not text:
+            return False
+            
+        # Check if it's just a number
+        if text.isdigit():
+            # Check if it's a reasonable page number (1-9999)
+            try:
+                num = int(text)
+                if 1 <= num <= 9999:
+                    return True
+            except ValueError:
+                pass
+                
+        # Check for common page number patterns
+        page_patterns = [
+            r'^\d+$',  # Just a number
+            r'^page\s+\d+$',  # "page X"
+            r'^p\.?\s*\d+$',  # "p. X" or "p X"
+            r'^\d+\s*of\s*\d+$',  # "X of Y"
+            r'^-\s*\d+\s*-$'  # "- X -"
+        ]
+        
+        import re
+        return any(re.match(pattern, text.lower()) for pattern in page_patterns)

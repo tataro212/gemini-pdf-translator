@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Try to import OCR dependencies
 try:
     import pytesseract
+    pytesseract.tesseract_cmd = r'C:\\Program Files\\Tesseract-OCR\\tesseract.exe' # Explicitly set Tesseract path
     from PIL import Image as PIL_Image, ImageFilter, ImageEnhance, ImageOps
     import numpy as np
     OCR_AVAILABLE = True

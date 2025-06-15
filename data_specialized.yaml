@@ -1,0 +1,16 @@
+train: C:/Users/30694/datasets/publaynet_yolo/images/train
+val: C:/Users/30694/datasets/publaynet_yolo/images/val
+
+nc: 10  # number of classes
+names: [
+    'figure',          # diagrams, illustrations, philosophical diagrams
+    'table',           # comparison tables, data tables
+    'list',            # bullet points, numbered lists, itemized arguments
+    'title',           # chapter titles, section headings
+    'caption',         # figure captions, image descriptions
+    'quote',           # block quotes, philosophical quotes
+    'footnote',        # footnotes, references
+    'equation',        # mathematical equations, logical formulas
+    'marginalia',      # margin notes, side comments
+    'bibliography'     # references, citations, works cited
+] 

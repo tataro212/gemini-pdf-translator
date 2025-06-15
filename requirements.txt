@@ -4,6 +4,9 @@ PyMuPDF>=1.23.0
 Pillow>=10.0.0
 python-docx>=1.1.0
 configparser>=6.0.0
+python-dotenv>=1.0.0 # Added for .env file loading
+pytesseract>=0.3.10 # Added for OCR functionality
+python-dateutil>=2.8.2 # Added as a dependency for pytesseract
 
 # Google API dependencies
 google-auth>=2.17.0
