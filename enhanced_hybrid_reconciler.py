@@ -281,57 +281,41 @@ class EnhancedHybridReconciler:
 
     def _correlate_with_yolo_classification(self, nougat_blocks: List[NougatBlock],
                                           visual_elements: List[EnhancedVisualElement]) -> List[Dict[str, Any]]:
-        """Enhanced correlation using YOLOv8 classification for supreme accuracy"""
+        """Correlate visual elements with Nougat blocks, ensuring visual content is excluded from translation"""
         correlated_content = []
         visual_elements_by_page = {}
-
+        
         # Group visual elements by page
         for element in visual_elements:
             page = element.page_num
             if page not in visual_elements_by_page:
                 visual_elements_by_page[page] = []
             visual_elements_by_page[page].append(element)
-
-        # Process each Nougat block with YOLOv8 intelligence
+        
+        # Process each Nougat block
         for block in nougat_blocks:
-            if block.content_type == 'image_placeholder':
-                # Find matching YOLOv8 visual element with supreme accuracy
-                page_visuals = visual_elements_by_page.get(block.page_num, [])
-                matched_element = self._find_best_yolo_match(block, page_visuals)
-
-                if matched_element:
-                    correlated_content.append({
-                        'type': 'enhanced_image_with_yolo',
-                        'nougat_block': block,
-                        'visual_element': matched_element,
-                        'yolo_classification': matched_element.element_type,
-                        'confidence': matched_element.confidence,
-                        'bypass_translation': True  # Images bypass translation
-                    })
-                    self.stats['correlation_successes'] += 1
-                else:
-                    # No YOLOv8 match found
-                    correlated_content.append({
-                        'type': 'image_placeholder_only',
-                        'nougat_block': block,
-                        'bypass_translation': True
-                    })
-                    self.stats['correlation_failures'] += 1
-            else:
-                # Regular content block - check if YOLOv8 detected it as text/title
-                page_visuals = visual_elements_by_page.get(block.page_num, [])
-                text_elements = [v for v in page_visuals if v.element_type in ['text', 'title', 'list']]
-
-                # Enhanced content classification using YOLOv8
-                enhanced_type = self._enhance_content_type_with_yolo(block, text_elements)
-
+            # Check if this block overlaps with any visual element
+            page_visuals = visual_elements_by_page.get(block.page_num, [])
+            overlapping_visual = self._find_best_yolo_match(block, page_visuals)
+            
+            if overlapping_visual:
+                # This is visual content - exclude from translation
                 correlated_content.append({
-                    'type': 'enhanced_text_content',
+                    'type': 'visual_content',
                     'nougat_block': block,
-                    'enhanced_classification': enhanced_type,
-                    'bypass_translation': False
+                    'visual_element': overlapping_visual,
+                    'exclude_from_translation': True,  # Always exclude visual content
+                    'content_type': overlapping_visual.element_type
                 })
-
+                self.logger.debug(f"Excluding visual content on page {block.page_num}: {overlapping_visual.element_type}")
+            else:
+                # Regular text content
+                correlated_content.append({
+                    'type': 'text_content',
+                    'nougat_block': block,
+                    'exclude_from_translation': False
+                })
+        
         return correlated_content
 
     def _find_best_yolo_match(self, nougat_block: NougatBlock,
@@ -369,3 +353,71 @@ class EnhancedHybridReconciler:
                 return 'enhanced_list'
 
         return nougat_block.content_type
+
+    def _create_enhanced_content_blocks(self, correlated_content: List[Dict[str, Any]], 
+                                     output_dir: str) -> List[ContentBlock]:
+        """Create content blocks, preserving visual content without translation"""
+        content_blocks = []
+        
+        for item in correlated_content:
+            if item['type'] == 'visual_content':
+                # Handle visual content - preserve original without translation
+                visual_element = item['visual_element']
+                content_type = item['content_type']
+                
+                if content_type == 'table':
+                    block = TablePlaceholder(
+                        original_element=visual_element,
+                        image_path=visual_element.source_path,
+                        exclude_from_translation=True
+                    )
+                else:  # Default to image placeholder
+                    block = ImagePlaceholder(
+                        original_element=visual_element,
+                        image_path=visual_element.source_path,
+                        exclude_from_translation=True
+                    )
+                
+                # Add a caption indicating this is original visual content
+                block.caption = f"[Original {content_type.capitalize()}]"
+                
+            else:
+                # Handle text content
+                nougat_block = item['nougat_block']
+                
+                if nougat_block.content_type == 'heading':
+                    block = Heading(
+                        content=nougat_block.content,
+                        level=nougat_block.level,
+                        original_element=nougat_block
+                    )
+                else:
+                    block = Paragraph(
+                        content=nougat_block.content,
+                        original_element=nougat_block
+                    )
+            
+            content_blocks.append(block)
+        
+        return content_blocks
+
+    def _create_enhanced_document(self, content_blocks: List[ContentBlock], 
+                            pdf_path: str, nougat_blocks: List[NougatBlock],
+                            visual_elements: List[EnhancedVisualElement]) -> StructuredDocument:
+        """Create enhanced document with visual content preservation"""
+        document = StructuredDocument(
+            title=self._extract_document_title(nougat_blocks),
+            content_blocks=content_blocks,
+            source_filepath=pdf_path,
+            total_pages=self._estimate_total_pages(visual_elements),
+            metadata={
+                'processing_method': 'enhanced_hybrid_reconciliation',
+                'nougat_blocks': len(nougat_blocks),
+                'visual_elements': len(visual_elements),
+                'visual_content_excluded': True,  # Flag indicating visual content is excluded
+                'yolo_detections': self.stats['yolo_detections'],
+                'heuristic_detections': self.stats['heuristic_detections']
+            }
+        )
+        
+        return document

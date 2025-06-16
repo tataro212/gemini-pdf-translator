@@ -35,7 +35,11 @@ except ImportError:
 class WordDocumentGenerator:
     """Generates Word documents with proper structure and formatting"""
     
-    def __init__(self):
+    def __init__(self, translation_service=None, pdf_parser=None):
+        """Initialize the document generator with translation service and PDF parser"""
+        self.translation_service = translation_service
+        self.pdf_parser = pdf_parser
+        self.logger = logging.getLogger(__name__)
         self.word_settings = config_manager.word_output_settings
         self.toc_entries = []
         self.bookmark_id = 0
@@ -212,105 +216,95 @@ class WordDocumentGenerator:
 
     # --- New method for inserting ToC (Step 3) ---
     def _insert_toc(self, doc):
-        """
-        Inserts a Table of Contents at the beginning of the document based on
-        the collected toc_entries.
-        """
+        """Insert table of contents at the beginning of the document based on collected toc_entries."""
         if not self.toc_entries:
-            logger.info("No headings found, skipping ToC generation.")
+            logger.info("No TOC entries found, skipping TOC generation")
             return
-
-        # Create TOC title
-        toc_title = doc.add_paragraph('Table of Contents', style='Title')
-        toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-        # Add TOC entries
-        for entry in self.toc_entries:
+            
+        logger.info("Generating Table of Contents...")
+        
+        # Create a new document for the TOC
+        toc_doc = Document()
+        
+        # Configure fonts for TOC document too
+        self._configure_document_fonts_for_unicode(toc_doc)
+        
+        # Add TOC title
+        title = toc_doc.add_paragraph("Table of Contents")
+        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title.style = 'Title'
+        
+        # Add a decorative line
+        line = toc_doc.add_paragraph()
+        line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        line.add_run("_" * 40)
+        
+        # Sort TOC entries by level and text
+        sorted_entries = sorted(self.toc_entries, key=lambda x: (x['level'], x['text']))
+        
+        # Add TOC entries with hyperlinks and page numbers
+        for entry in sorted_entries:
             level = entry['level']
             text_for_display = sanitize_for_xml(entry['text'])
             bookmark = entry['bookmark']
             
             # Create TOC entry paragraph
-            p = doc.add_paragraph()
+            p = toc_doc.add_paragraph()
             p.style = 'Normal'
             
-            # Set indentation
+            # Set indentation based on level
             indent_size = Pt(20 * (level - 1))
             p.paragraph_format.left_indent = indent_size
             
-            # Add hyperlink
-            hyperlink = OxmlElement('w:hyperlink')
-            hyperlink.set(qn('w:anchor'), bookmark)
-            
-            run_el = OxmlElement('w:r')
-            text_el = OxmlElement('w:t')
-            text_el.text = text_for_display
-            run_el.append(text_el)
-            hyperlink.append(run_el)
-            
-            p._p.append(hyperlink)
-            
-            # Add tab and page number
-            tab_run = p.add_run()
-            tab_run._r.append(OxmlElement('w:tab'))
-            
-            pageref_run = p.add_run()
+            # Add heading text with hyperlink
+            try:
+                hyperlink_run = self._add_hyperlink(p, text_for_display, bookmark)
+                if level == 1:
+                    hyperlink_run.bold = True
+                    hyperlink_run.font.size = Pt(12)
+                elif level == 2:
+                    hyperlink_run.font.size = Pt(11)
+                else:
+                    hyperlink_run.font.size = Pt(10)
+                    hyperlink_run.italic = True
+            except Exception as e:
+                logger.debug(f"Could not create hyperlink for {text_for_display}: {e}")
+                # Fallback to regular text
+                text_run = p.add_run(text_for_display)
+                if level == 1:
+                    text_run.bold = True
+                    text_run.font.size = Pt(12)
+                elif level == 2:
+                    text_run.font.size = Pt(11)
+                else:
+                    text_run.font.size = Pt(10)
+                    text_run.italic = True
+
+            # Add dots and page number
+            dots_needed = max(3, 60 - len(text_for_display))
+            dots_run = p.add_run(" " + "." * dots_needed + " ")
+            dots_run.font.color.rgb = RGBColor(128, 128, 128)
+
+            # Add page reference field
             fldSimple = OxmlElement('w:fldSimple')
             fldSimple.set(qn('w:instr'), f'PAGEREF {bookmark} \\h')
             
             run_in_field = OxmlElement('w:r')
             text_in_field = OxmlElement('w:t')
-            text_in_field.text = "..."
+            text_in_field.text = "..."  # Placeholder that will be replaced with actual page number
             run_in_field.append(text_in_field)
             fldSimple.append(run_in_field)
             
-            pageref_run._r.append(fldSimple)
-
-        # Add page break after TOC
-        doc.add_page_break()
-
-        # Instead of trying to move TOC to beginning, we'll create a new document
-        # with TOC first, then append the rest of the content
-        try:
-            # Create a new document
-            new_doc = Document()
-            
-            # Copy TOC paragraphs to new document
-            toc_paras = []
-            for para in doc.paragraphs:
-                if para.text == 'Table of Contents':
-                    toc_paras.append(para)
-                elif toc_paras and para.text == '':
-                    toc_paras.append(para)
-                elif not toc_paras:
-                    continue
-                else:
-                    break
-            
-            # Add TOC paragraphs to new document
-            for para in toc_paras:
-                new_para = new_doc.add_paragraph()
-                new_para._p.getparent().remove(new_para._p)
-                new_para._p = para._p
-            
-            # Add page break
-            new_doc.add_page_break()
-            
-            # Copy remaining content
-            for para in doc.paragraphs:
-                if para not in toc_paras:
-                    new_para = new_doc.add_paragraph()
-                    new_para._p.getparent().remove(new_para._p)
-                    new_para._p = para._p
-            
-            # Replace original document with new one
-            doc._element = new_doc._element
-            
-        except Exception as e:
-            logger.warning(f"Could not reorganize document with TOC at beginning: {e}")
-            # Continue with TOC at current position if reorganization fails
-
-        logger.info("Successfully generated and inserted the Table of Contents.")
+            p._p.append(fldSimple)
+        
+        # Add spacing after TOC
+        toc_doc.add_paragraph()
+        
+        # Insert TOC at the beginning of the document
+        for element in toc_doc.element.body:
+            doc.element.body.insert(0, element)
+        
+        logger.info(f"Successfully generated TOC with {len(sorted_entries)} entries")
 
     def create_word_document_with_structure(self, structured_content_list, output_filepath,
                                           image_folder_path, cover_page_data=None):
@@ -976,27 +970,289 @@ class WordDocumentGenerator:
 
         return final_headings
 
-# --- Placeholder for PDF Conversion ---
-def convert_word_to_pdf(docx_filepath, pdf_filepath):
-    logger.warning(f"PDF conversion for '{docx_filepath}' to '{pdf_filepath}' is not fully implemented yet.")
-    # Placeholder: In a real implementation, you would use a library like docx2pdf.
-    # For example:
-    # try:
-    #     from docx2pdf import convert
-    #     convert(docx_filepath, pdf_filepath)
-    #     logger.info(f"Successfully converted {docx_filepath} to {pdf_filepath}")
-    #     return True
-    # except ImportError:
-    #     logger.error("docx2pdf library is not installed. Please install it to enable PDF conversion.")
-    #     return False
-    # except Exception as e:
-    #     logger.error(f"Error converting Word to PDF: {e}")
-    #     return False
-    return False # Indicate failure or not implemented
+    def _configure_document_fonts_for_unicode(self, doc):
+        """Configure document fonts to properly support Greek and other Unicode characters"""
+        try:
+            # Set the default font for the entire document to support Greek characters
+            style = doc.styles['Normal']
+            font = style.font
+            font.name = 'Arial Unicode MS'  # Comprehensive Unicode font
+            font.size = Pt(11)
+            
+            # Set the complex script font for Greek and other complex scripts
+            rpr = style.element.xpath('.//w:rPr')[0] if style.element.xpath('.//w:rPr') else None
+            if rpr is not None:
+                rFonts = rpr.find(qn('w:rFonts'))
+                if rFonts is None:
+                    rFonts = OxmlElement("w:rFonts")
+                    rpr.insert(0, rFonts)
+                
+                # Set fonts for different script types
+                rFonts.set(qn('w:ascii'), 'Arial Unicode MS')
+                rFonts.set(qn('w:hAnsi'), 'Arial Unicode MS')
+                rFonts.set(qn('w:cs'), 'Arial Unicode MS')  # Complex scripts (Greek, Arabic, etc.)
+                rFonts.set(qn('w:eastAsia'), 'Arial Unicode MS')  # East Asian scripts
+                rFonts.set(qn('w:asciiTheme'), 'Arial Unicode MS')
+                rFonts.set(qn('w:hAnsiTheme'), 'Arial Unicode MS')
+                rFonts.set(qn('w:eastAsiaTheme'), 'Arial Unicode MS')
+                rFonts.set(qn('w:cstheme'), 'Arial Unicode MS')
+            
+            # Also configure heading styles
+            for i in range(1, 7):  # Heading 1 through Heading 6
+                try:
+                    heading_style = doc.styles[f'Heading {i}']
+                    heading_font = heading_style.font
+                    heading_font.name = 'Arial Unicode MS'
+                    
+                    # Set complex script font for headings too
+                    heading_rpr = heading_style.element.xpath('.//w:rPr')[0] if heading_style.element.xpath('.//w:rPr') else None
+                    if heading_rpr is not None:
+                        heading_rFonts = heading_rpr.find(qn('w:rFonts'))
+                        if heading_rFonts is None:
+                            heading_rFonts = OxmlElement("w:rFonts")
+                            heading_rpr.insert(0, heading_rFonts)
+                        
+                        heading_rFonts.set(qn('w:ascii'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:hAnsi'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:cs'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:eastAsia'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:asciiTheme'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:hAnsiTheme'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:eastAsiaTheme'), 'Arial Unicode MS')
+                        heading_rFonts.set(qn('w:cstheme'), 'Arial Unicode MS')
+                        
+                except KeyError:
+                    # Style doesn't exist, skip
+                    continue
+            
+            # Configure TOC styles
+            try:
+                toc_style = doc.styles['TOC 1']
+                toc_font = toc_style.font
+                toc_font.name = 'Arial Unicode MS'
+                
+                # Set complex script font for TOC
+                toc_rpr = toc_style.element.xpath('.//w:rPr')[0] if toc_style.element.xpath('.//w:rPr') else None
+                if toc_rpr is not None:
+                    toc_rFonts = toc_rpr.find(qn('w:rPr'))
+                    if toc_rFonts is None:
+                        toc_rFonts = OxmlElement("w:rPr")
+                        toc_rpr.insert(0, toc_rFonts)
+                    
+                    toc_rFonts.set(qn('w:ascii'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:hAnsi'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:cs'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:eastAsia'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:asciiTheme'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:hAnsiTheme'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:eastAsiaTheme'), 'Arial Unicode MS')
+                    toc_rFonts.set(qn('w:cstheme'), 'Arial Unicode MS')
+            except KeyError:
+                logger.warning("TOC style not found, skipping TOC font configuration")
+            
+            logger.info("Document fonts configured for Unicode support (Greek, etc.)")
+            
+        except Exception as e:
+            logger.warning(f"Could not configure Unicode fonts: {e}")
 
-# Assign the function to the name expected by main_workflow.py
-pdf_converter = convert_word_to_pdf
-# --- End of Placeholder for PDF Conversion ---
+    def _insert_visual_content(self, doc, visual_content, page_num):
+        """Insert visual content into the document without translation"""
+        try:
+            for area in visual_content:
+                bbox = area['bbox']
+                content_type = area['content_type']
+                confidence = area.get('confidence', 0.5)
+
+                # Only insert if confidence is high enough
+                if confidence < 0.5:
+                    logger.debug(f"Skipping low confidence visual content on page {page_num + 1}")
+                    continue
+
+                # Add a section break before visual content
+                doc.add_section_break()
+
+                # Add a caption indicating this is visual content
+                p = doc.add_paragraph()
+                p.add_run(f"[Original Visual Content - {content_type}]").italic = True
+
+                # Insert the visual content without translation
+                if content_type == 'page_with_drawings':
+                    self._insert_drawing_area(doc, bbox, page_num)
+                elif content_type == 'image_area':
+                    self._insert_image_area(doc, bbox, page_num)
+                elif content_type == 'sparse_text_page':
+                    self._insert_sparse_text_area(doc, bbox, page_num)
+
+                # Add a section break after visual content
+                doc.add_section_break()
+
+        except Exception as e:
+            logger.error(f"Error inserting visual content: {e}")
+            raise
+
+    def _insert_drawing_area(self, doc, bbox, page_num):
+        """Insert a drawing area without translation"""
+        try:
+            # Insert the drawing as is
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(f"page_{page_num + 1}_drawing.png")
+            logger.info(f"Inserted original drawing from page {page_num + 1}")
+
+        except Exception as e:
+            logger.error(f"Error inserting drawing area: {e}")
+            raise
+
+    def _insert_image_area(self, doc, bbox, page_num):
+        """Insert an image area without translation"""
+        try:
+            # Insert the image as is
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(f"page_{page_num + 1}_image.png")
+            logger.info(f"Inserted original image from page {page_num + 1}")
+
+        except Exception as e:
+            logger.error(f"Error inserting image area: {e}")
+            raise
+
+    def _insert_sparse_text_area(self, doc, bbox, page_num):
+        """Insert a sparse text area without translation"""
+        try:
+            # Insert the content as is
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(f"page_{page_num + 1}_sparse.png")
+            logger.info(f"Inserted original sparse content from page {page_num + 1}")
+
+        except Exception as e:
+            logger.error(f"Error inserting sparse text area: {e}")
+            raise
+
+    def _is_area_translated(self, bbox, page_num):
+        """Check if a visual content area has been properly translated"""
+        try:
+            # Get the text content in this area
+            text = self.pdf_parser.get_text_in_area(page_num, bbox)
+            
+            # If there's no text, consider it translated
+            if not text.strip():
+                return True
+
+            # Check if the text has been translated
+            # This assumes you have a way to track translated content
+            # You might need to implement this based on your translation tracking system
+            return self._is_text_translated(text, page_num)
+
+        except Exception as e:
+            logger.error(f"Error checking area translation status: {e}")
+            return False
+
+    def _is_text_translated(self, text, page_num):
+        """Check if text has been translated by comparing with translation cache"""
+        try:
+            # Get the translation cache from the translation service
+            translation_cache = self.translation_service.get_translation_cache()
+            
+            # Check if this text exists in the cache
+            if text in translation_cache:
+                return True
+                
+            # If not in cache, check if it's part of a larger translated segment
+            for original, translated in translation_cache.items():
+                if text in original:
+                    return True
+                    
+            # If we get here, the text hasn't been translated
+            logger.warning(f"Text on page {page_num + 1} has not been translated")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error checking translation status: {e}")
+            return False
+
+# Enhanced PDF conversion function with proper font embedding
+def convert_word_to_pdf(docx_filepath, pdf_filepath):
+    """Enhanced PDF conversion with proper Greek font support"""
+    logger.info(f"Converting {docx_filepath} to PDF with Unicode font support...")
+    
+    try:
+        # Try using docx2pdf first
+        from docx2pdf import convert
+        convert(docx_filepath, pdf_filepath)
+        logger.info(f"Successfully converted {docx_filepath} to {pdf_filepath}")
+        return True
+        
+    except ImportError:
+        logger.warning("docx2pdf library not available. Trying alternative method...")
+        
+        try:
+            # Alternative: Use python-docx2txt + reportlab for better font control
+            import docx2txt
+            from reportlab.lib.pagesizes import letter
+            from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.fonts import addMapping
+            from reportlab.pdfbase import pdfmetrics
+            from reportlab.pdfbase.ttfonts import TTFont
+            
+            # Register Unicode font
+            try:
+                # Try to register Arial Unicode MS or fallback to DejaVu
+                pdfmetrics.registerFont(TTFont('ArialUnicode', 'arial.ttf'))
+                addMapping('ArialUnicode', 0, 0, 'ArialUnicode')
+            except:
+                # Fallback to DejaVu Sans which supports Greek
+                try:
+                    pdfmetrics.registerFont(TTFont('DejaVuSans', 'DejaVuSans.ttf'))
+                    addMapping('DejaVuSans', 0, 0, 'DejaVuSans')
+                    font_name = 'DejaVuSans'
+                except:
+                    font_name = 'Helvetica'  # Last resort
+                    logger.warning("Could not register Unicode font, using Helvetica")
+            
+            # Extract text from DOCX
+            text = docx2txt.process(docx_filepath)
+            
+            # Create PDF with proper font
+            doc = SimpleDocTemplate(pdf_filepath, pagesize=letter)
+            styles = getSampleStyleSheet()
+            
+            # Create custom style with Unicode font
+            unicode_style = ParagraphStyle(
+                'UnicodeNormal',
+                parent=styles['Normal'],
+                fontName=font_name,
+                fontSize=11,
+                encoding='utf-8'
+            )
+            
+            # Build PDF content
+            story = []
+            for line in text.split('\n'):
+                if line.strip():
+                    story.append(Paragraph(line, unicode_style))
+                    story.append(Spacer(1, 12))
+            
+            doc.build(story)
+            logger.info(f"Successfully converted {docx_filepath} to {pdf_filepath} with Unicode support")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Alternative PDF conversion failed: {e}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Error converting Word to PDF: {e}")
+        return False
+
+# Create a class to hold the PDF conversion function
+class PDFConverter:
+    def __init__(self):
+        self.convert_word_to_pdf = convert_word_to_pdf
+
+# Create an instance of the PDF converter
+pdf_converter = PDFConverter()
 
 # Instantiate the generator for use by other modules
 document_generator = WordDocumentGenerator()

@@ -719,115 +719,97 @@ class UltimatePDFTranslator:
 
     async def _translate_document_intelligent(self, filepath, output_dir_for_this_file,
                                             target_language_override=None, precomputed_style_guide=None):
-        """Intelligent translation workflow using the dynamic processing pipeline"""
-
-        logger.info(f"🧠 Starting INTELLIGENT translation of: {os.path.basename(filepath)}")
-        start_time = time.time()
-
+        """Intelligent translation workflow with advanced features"""
         try:
-            # Validate inputs
-            if not os.path.exists(filepath):
-                raise FileNotFoundError(f"Input file not found: {filepath}")
+            # ... existing code ...
 
-            if not os.path.exists(output_dir_for_this_file):
-                os.makedirs(output_dir_for_this_file, exist_ok=True)
+            # STEP 2: Use parallel translation on structured document (MUCH FASTER!)
+            with span("parallel_translation", SpanType.TRANSLATION,
+                     translation_method="parallel_structured", target_language=target_language):
+                logger.info("🚀 Step 2: Processing translation with PARALLEL processing...")
+                logger.info("   🔥 Using structured document model for maximum speed")
 
-            # Set target language
-            target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
-
-            # Step 1: Extract structured document
-            logger.info("📄 Step 1: Extracting structured document...")
-
-            # Extract images first
-            image_folder = os.path.join(output_dir_for_this_file, "images")
-            extracted_images = self.pdf_parser.extract_images_from_pdf(filepath, image_folder)
-
-            # Extract cover page
-            cover_page_data = self.pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
-
-            # Extract structured content as Document object
-            if STRUCTURED_MODEL_AVAILABLE:
-                document = self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
-                if not document or not document.content_blocks:
-                    raise Exception("No content could be extracted from the PDF")
-                logger.info(f"📊 Extracted document: {document.get_statistics()}")
-            else:
-                # Fallback to legacy format and convert
-                from structured_document_model import convert_legacy_structured_content_to_document
-                legacy_content = self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
-                document = convert_legacy_structured_content_to_document(
-                    legacy_content,
-                    title=os.path.splitext(os.path.basename(filepath))[0],
-                    source_filepath=filepath
+                translated_document = await translation_service.translate_document(
+                    structured_document, target_language, ""
                 )
 
-            # Step 2: Process with intelligent pipeline
-            logger.info("🧠 Step 2: Processing with intelligent pipeline...")
-            intelligent_result = await self.intelligent_pipeline.translate_document_intelligently(
-                pdf_path=filepath,
-                output_dir=output_dir_for_this_file,
-                target_language=target_language
-            )
+                add_metadata(
+                    translation_method="parallel_structured",
+                    blocks_translated=len(structured_document.get_translatable_blocks()),
+                    validation_passed=True
+                )
 
-            # Step 3: Generate output documents
-            logger.info("📄 Step 3: Generating output documents...")
-            base_filename = os.path.splitext(os.path.basename(filepath))[0]
-            output_dir_for_this_file = os.path.normpath(output_dir_for_this_file)
-            word_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx"))
-            pdf_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf"))
+                # Count preserved images
+                translated_image_blocks = [block for block in translated_document.content_blocks if hasattr(block, 'image_path') and block.image_path]
+                add_metadata(image_placeholders_preserved=len(translated_image_blocks))
 
-            # Generate Word document from processed document
-            saved_word_filepath = document_generator.create_word_document_from_structured_document(
-                intelligent_result.processed_document, word_output_path, image_folder, cover_page_data
-            )
+            # STEP 3: Generate Word document
+            with span("generate_word", SpanType.DOCUMENT_GENERATION):
+                logger.info("📄 Step 3: Generating Word document...")
+                try:
+                    saved_word_filepath = document_generator.create_word_document_from_structured_document(
+                        translated_document, word_output_path, image_folder, cover_page_data
+                    )
+                except Exception as doc_error:
+                    logger.error(f"❌ Document generation failed with error: {doc_error}")
+                    logger.error(f"   • Structured document blocks: {len(translated_document.content_blocks) if translated_document else 'N/A'}")
+                    logger.error(f"   • Target directory exists: {os.path.exists(output_dir_for_this_file)}")
+                    logger.error(f"   • Target directory writable: {os.access(output_dir_for_this_file, os.W_OK)}")
+                    add_metadata(error_count=1, validation_passed=False)
+                    raise Exception(f"Failed to create Word document from advanced translation: {doc_error}")
 
-            if not saved_word_filepath:
-                raise Exception("Failed to create Word document from intelligent translation")
+                if not saved_word_filepath:
+                    add_metadata(error_count=1, validation_passed=False)
+                    raise Exception("Failed to create Word document from advanced translation")
 
             # Convert to PDF
-            logger.info("📑 Step 4: Converting to PDF...")
-            pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
+            with span("convert_to_pdf", SpanType.DOCUMENT_GENERATION, output_format="pdf"):
+                logger.info("📑 Converting to PDF...")
+                pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
+                add_metadata(pdf_conversion_success=pdf_success)
 
             # Upload to Google Drive (if configured)
             drive_results = []
             if drive_uploader.is_available():
-                logger.info("☁️ Step 5: Uploading to Google Drive...")
-                files_to_upload = [
-                    {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
-                ]
+                with span("upload_to_drive", SpanType.DOCUMENT_GENERATION):
+                    logger.info("☁️ Uploading to Google Drive...")
+                    files_to_upload = [
+                        {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
+                    ]
 
-                if pdf_success and os.path.exists(pdf_output_path):
-                    files_to_upload.append({
-                        'filepath': pdf_output_path,
-                        'filename': f"{base_filename}_translated.pdf"
-                    })
+                    if pdf_success and os.path.exists(pdf_output_path):
+                        files_to_upload.append({
+                            'filepath': pdf_output_path,
+                            'filename': f"{base_filename}_translated.pdf"
+                        })
 
-                drive_results = drive_uploader.upload_multiple_files(files_to_upload)
+                    drive_results = drive_uploader.upload_multiple_files(files_to_upload)
+                    add_metadata(files_uploaded=len(drive_results))
 
-            # Generate intelligent final report
+            # Generate enhanced final report
             end_time = time.time()
-            self._generate_intelligent_final_report(
+            self._generate_structured_final_report(
                 filepath, output_dir_for_this_file, start_time, end_time,
-                intelligent_result, drive_results, pdf_success
+                structured_document, translated_document, drive_results, pdf_success
             )
 
             # Save caches
             translation_service.save_caches()
 
-            logger.info("✅ Intelligent translation workflow completed successfully!")
+            # Finish distributed trace
+            finish_trace()
+
+            logger.info("✅ Advanced translation workflow completed successfully!")
             return precomputed_style_guide
 
         except Exception as e:
-            logger.error(f"❌ Intelligent translation workflow failed: {e}")
-            logger.info("🔄 Falling back to advanced translation workflow...")
-            if self.advanced_pipeline:
-                return await self._translate_document_advanced(
-                    filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
-                )
-            else:
-                return await self._translate_document_standard(
-                    filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
-                )
+            # Finish trace on error
+            finish_trace()
+            logger.error(f"❌ Advanced translation workflow failed: {e}")
+            logger.info("🔄 Falling back to standard translation workflow...")
+            return await self._translate_document_standard(
+                filepath, output_dir_for_this_file, target_language_override, precomputed_style_guide
+            )
 
     async def _translate_document_advanced(self, filepath, output_dir_for_this_file,
                                          target_language_override=None, precomputed_style_guide=None):
@@ -1052,147 +1034,23 @@ class UltimatePDFTranslator:
 
     async def _translate_document_standard(self, filepath, output_dir_for_this_file,
                                          target_language_override=None, precomputed_style_guide=None):
-        """Standard translation workflow (original implementation)"""
-
-        start_time = time.time()
-        
+        """Standard translation workflow without advanced features"""
         try:
-            # Validate inputs
-            if not os.path.exists(filepath):
-                raise FileNotFoundError(f"Input file not found: {filepath}")
-            
-            if not os.path.exists(output_dir_for_this_file):
-                os.makedirs(output_dir_for_this_file, exist_ok=True)
-            
-            # Set up output paths with proper path normalization
-            base_filename = os.path.splitext(os.path.basename(filepath))[0]
-            # Normalize the output directory path to fix mixed separators
-            output_dir_for_this_file = os.path.normpath(output_dir_for_this_file)
-            image_folder = os.path.join(output_dir_for_this_file, "images")
-            word_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx"))
-            pdf_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf"))
-            
-            # Step 1: Extract images from PDF (with enhanced Nougat or fallback)
-            if self.nougat_integration is None:
-                logger.info("📷 Step 1: Extracting images with traditional PDF processing...")
-                logger.warning("⚠️ Nougat not available - using standard image extraction")
-            elif self.nougat_only_mode:
-                logger.info("📷 Step 1: NOUGAT-ONLY visual content extraction...")
-                logger.info("🎯 NOUGAT-ONLY: Paintings, Schemata, Diagrams, Equations, Tables, Everything!")
-                logger.info("🚫 NO FALLBACK: Traditional image extraction disabled")
-            else:
-                logger.info("📷 Step 1: Extracting images with Nougat capabilities...")
-                if hasattr(self.pdf_parser, 'nougat_enhanced'):
-                    logger.info("🎯 Using enhanced mode: Mathematical equations, Complex tables, Scientific diagrams")
+            # ... existing code ...
 
-            extracted_images = self.pdf_parser.extract_images_from_pdf(filepath, image_folder)
-
-            # Report analysis results based on available integration
-            if self.nougat_integration is None:
-                logger.info("📊 Traditional PDF analysis: Using standard image extraction methods")
-                logger.info(f"   📷 Extracted {len(extracted_images)} images using conventional methods")
-            elif self.nougat_only_mode and hasattr(self.pdf_parser, '_nougat_only_analysis'):
-                # NOUGAT-ONLY mode analysis
-                analysis = self.pdf_parser._nougat_only_analysis
-                visual_elements = analysis.get('visual_elements', [])
-
-                # Count by category
-                categories = {}
-                for element in visual_elements:
-                    cat = element.get('category', 'unknown')
-                    categories[cat] = categories.get(cat, 0) + 1
-
-                logger.info(f"📊 NOUGAT-ONLY analysis: {len(visual_elements)} total visual elements")
-                for category, count in categories.items():
-                    logger.info(f"   📋 {category}: {count}")
-
-                high_priority = len([e for e in visual_elements if e.get('priority', 0) >= 0.9])
-                if high_priority > 0:
-                    logger.info(f"⭐ Found {high_priority} high-priority elements")
-
-            elif hasattr(self.pdf_parser, '_nougat_analysis'):
-                # Enhanced Nougat mode analysis
-                nougat_analysis = self.pdf_parser._nougat_analysis
-                summary = nougat_analysis.get('summary', {})
-                logger.info(f"📊 Nougat analysis: {summary.get('mathematical_elements', 0)} equations, "
-                           f"{summary.get('tabular_elements', 0)} tables, "
-                           f"{summary.get('visual_elements', 0)} visual elements")
-
-                priority_count = summary.get('high_priority_count', 0)
-                if priority_count > 0:
-                    logger.info(f"⭐ Found {priority_count} high-priority elements for enhanced processing")
-            else:
-                logger.info(f"📊 Standard analysis: Extracted {len(extracted_images)} images using traditional methods")
-            
-            # Step 2: Extract cover page
-            logger.info("📄 Step 2: Extracting cover page...")
-            cover_page_data = self.pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
-            
-            # Step 3: Extract structured content
-            logger.info("📝 Step 3: Extracting structured content...")
-            document = self.content_extractor.extract_structured_content_from_pdf(
-                filepath, extracted_images
-            )
-
-            if not document or not document.content_blocks:
-                raise Exception("No content could be extracted from the PDF")
-
-            # REINSTATE Legacy Conversion for standard workflow:
-            from structured_document_model import convert_document_to_legacy_format
-            structured_content_legacy = convert_document_to_legacy_format(document)
-            logger.info(f"📋 Converted Document to legacy format: {len(structured_content_legacy)} items")
-            # logger.debug(f"📋 Legacy content type: {type(structured_content_legacy)}")
-            # if structured_content_legacy and len(structured_content_legacy) > 0:
-            #     logger.debug(f"📋 First item type: {type(structured_content_legacy[0])}")
-            #     logger.debug(f"📋 First item: {structured_content_legacy[0]}")
-            # else:
-            #     logger.warning("📋 No content in legacy format!")
-
-            # Step 3.5: Restructure text to separate footnotes
-            # This method expects a list of dictionaries.
-            logger.info("🔧 Step 3.5: Restructuring text and separating footnotes...")
-            # _restructure_content_text modifies structured_content_legacy in place or returns a new list of dicts
-            # Assuming it modifies in place or returns the modified list.
-            # The original code was: structured_content = self._restructure_content_text(structured_content)
-            # So, it likely returns the modified list.
-            structured_content_legacy = self._restructure_content_text(structured_content_legacy)
-            
-            # Step 4: Analyze images for translation
-            logger.info("🔍 Step 4: Analyzing images...")
-            if extracted_images:
-                image_paths = [img['filepath'] for img in extracted_images]
-                image_analysis = self.image_analyzer.batch_analyze_images(image_paths)
-                
-                # This method needs to work with the list of dicts
-                self._integrate_image_analysis(structured_content_legacy, image_analysis)
-            
-            # Step 5: Optimize content for translation
-            logger.info("⚡ Step 5: Optimizing content...")
+            # Step 5: Translate the structured document
+            logger.info("🌐 Step 5: Translating structured document...")
             target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
-            
-            # Filter out image items for optimization from the list of dicts
-            text_items_legacy = [item for item in structured_content_legacy if item.get('type') != 'image']
-            
-            optimized_batches, optimization_params = optimization_manager.optimize_content_for_translation(
-                text_items_legacy, target_language 
+
+            # Create translated document
+            translated_document = await translation_service.translate_document(
+                document, target_language, precomputed_style_guide or ""
             )
-            
-            # Step 6: Translate content
-            logger.info("🌐 Step 6: Translating content...")
-            translated_content_legacy = await self._translate_batches( # This will be a list of translated dicts/strings
-                optimized_batches, target_language, precomputed_style_guide
-            )
-            
-            # Step 7: Reconstruct full content with images
-            # This method needs to work with the list of dicts
-            logger.info("🔧 Step 7: Reconstructing document...")
-            final_content_legacy = self._reconstruct_full_content(structured_content_legacy, translated_content_legacy)
-            
-            # Step 8: Generate Word document
-            logger.info("📄 Step 8: Generating Word document...")
-            # This call expects a list of dicts if create_word_document_with_structure is to handle it.
-            saved_word_filepath = document_generator.create_word_document_with_structure(
-                final_content_legacy, word_output_path, image_folder, cover_page_data
+
+            # Step 6: Generate Word document from structured document
+            logger.info("📄 Step 6: Generating Word document...")
+            saved_word_filepath = document_generator.create_word_document_from_structured_document(
+                translated_document, word_output_path, image_folder, cover_page_data
             )
 
             if not saved_word_filepath:
@@ -1201,11 +1059,10 @@ class UltimatePDFTranslator:
             # Convert to PDF if enabled
             pdf_output_path = ""
             pdf_success = False
-            # CORRECTED to use word_output_settings and .get()
             if config_manager.word_output_settings.get('generate_pdf', False):
-                logger.info("📑 Step 9: Converting to PDF...")
+                logger.info("📑 Step 7: Converting to PDF...")
                 pdf_output_path = os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf")
-                pdf_success = pdf_converter(saved_word_filepath, pdf_output_path)
+                pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
             else:
                 logger.info("📄 PDF generation skipped by configuration.")
 
@@ -1255,103 +1112,98 @@ class UltimatePDFTranslator:
             )
 
         start_time = time.time()
-
+        
         try:
             # Validate inputs
             if not os.path.exists(filepath):
                 raise FileNotFoundError(f"Input file not found: {filepath}")
-
+            
             if not os.path.exists(output_dir_for_this_file):
                 os.makedirs(output_dir_for_this_file, exist_ok=True)
-
+            
             # Set up output paths
             base_filename = os.path.splitext(os.path.basename(filepath))[0]
             output_dir_for_this_file = os.path.normpath(output_dir_for_this_file)
             image_folder = os.path.join(output_dir_for_this_file, "images")
             word_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.docx"))
             pdf_output_path = os.path.normpath(os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf"))
-
-            # Step 1: Extract images from PDF
-            logger.info("📷 Step 1: Extracting images...")
+            
+            # Step 1: Extract images and cover page
+            logger.info("📷 Step 1: Extracting images and cover page...")
             extracted_images = self.pdf_parser.extract_images_from_pdf(filepath, image_folder)
-
-            # Step 2: Extract cover page
-            logger.info("📄 Step 2: Extracting cover page...")
             cover_page_data = self.pdf_parser.extract_cover_page_from_pdf(filepath, output_dir_for_this_file)
-
-            # Step 3: Extract structured content as Document object
-            logger.info("📝 Step 3: Extracting structured document...")
-            document = self.content_extractor.extract_structured_content_from_pdf(filepath, extracted_images)
-
+            
+            # Step 2: Extract structured content
+            logger.info("📝 Step 2: Extracting structured content...")
+            document = self.content_extractor.extract_structured_content_from_pdf(
+                filepath, extracted_images
+            )
+            
             if not document or not document.content_blocks:
                 raise Exception("No content could be extracted from the PDF")
-
-            logger.info(f"📊 Extracted document: {document.get_statistics()}")
-
-            # Step 4: Analyze images for translation (integrate with Document)
-            logger.info("🔍 Step 4: Analyzing images...")
+            
+            # Step 3: Analyze images
+            logger.info("🔍 Step 3: Analyzing images...")
             if extracted_images:
                 image_paths = [img['filepath'] for img in extracted_images]
                 image_analysis = self.image_analyzer.batch_analyze_images(image_paths)
                 self._integrate_image_analysis_into_document(document, image_analysis)
-
-            # Step 5: Translate the structured document
-            logger.info("🌐 Step 5: Translating structured document...")
+            
+            # Step 4: Translate the structured document
+            logger.info("🌐 Step 4: Translating structured document...")
             target_language = target_language_override or config_manager.translation_enhancement_settings['target_language']
-
+            
             translated_document = await translation_service.translate_document(
                 document, target_language, precomputed_style_guide or ""
             )
-
-            # Step 6: Generate Word document from structured document
-            logger.info("📄 Step 6: Generating Word document...")
+            
+            # Step 5: Generate Word document
+            logger.info("📄 Step 5: Generating Word document...")
             saved_word_filepath = document_generator.create_word_document_from_structured_document(
                 translated_document, word_output_path, image_folder, cover_page_data
             )
-
+            
             if not saved_word_filepath:
                 raise Exception("Failed to create Word document")
-
-            # Convert to PDF if enabled
-            pdf_output_path = ""
+            
+            # Step 6: Convert to PDF if enabled
             pdf_success = False
-            # CORRECTED to use word_output_settings and .get()
             if config_manager.word_output_settings.get('generate_pdf', False):
-                logger.info("📑 Step 9: Converting to PDF...")
-                pdf_output_path = os.path.join(output_dir_for_this_file, f"{base_filename}_translated.pdf")
-                pdf_success = pdf_converter(saved_word_filepath, pdf_output_path)
+                logger.info("📑 Step 6: Converting to PDF...")
+                pdf_success = pdf_converter.convert_word_to_pdf(saved_word_filepath, pdf_output_path)
             else:
                 logger.info("📄 PDF generation skipped by configuration.")
-
-            # Upload to Google Drive (if configured)
+            
+            # Step 7: Upload to Google Drive if configured
             drive_results = []
             if drive_uploader.is_available():
-                logger.info("☁️ Step 8: Uploading to Google Drive...")
+                logger.info("☁️ Step 7: Uploading to Google Drive...")
                 files_to_upload = [
                     {'filepath': word_output_path, 'filename': f"{base_filename}_translated.docx"}
                 ]
-
+                
                 if pdf_success and os.path.exists(pdf_output_path):
                     files_to_upload.append({
                         'filepath': pdf_output_path,
                         'filename': f"{base_filename}_translated.pdf"
                     })
-
+                
                 drive_results = drive_uploader.upload_multiple_files(files_to_upload)
-
-            # Step 9: Generate final report
+            
+            # Step 8: Generate final report
             end_time = time.time()
             self._generate_structured_final_report(
                 filepath, output_dir_for_this_file, start_time, end_time,
                 document, translated_document, drive_results, pdf_success
             )
-
+            
             # Save translation cache
             translation_service.save_caches()
-
+            
+            
             logger.info("✅ Structured document translation completed successfully!")
             return precomputed_style_guide
-
+            
         except Exception as e:
             logger.error(f"❌ Structured document translation failed: {e}")
             raise
@@ -2109,6 +1961,65 @@ class UltimatePDFTranslator:
 
         logger.debug(f"✅ Data integrity validated at {stage_name}")
 
+    def process_document(self, pdf_path: str, output_dir: str) -> str:
+        """Process a document through the enhanced workflow with visual content exclusion"""
+        try:
+            self.logger.info(f"Starting enhanced document processing: {pdf_path}")
+            
+            # Step 1: Extract text content with Nougat
+            nougat_output = self.nougat_processor.process_pdf(pdf_path)
+            self.logger.info("Nougat text extraction completed")
+            
+            # Step 2: Enhanced hybrid reconciliation with visual content exclusion
+            reconciler = EnhancedHybridReconciler()
+            document = asyncio.run(reconciler.reconcile_content_enhanced(
+                nougat_output=nougat_output,
+                pdf_path=pdf_path,
+                output_dir=output_dir
+            ))
+            self.logger.info("Enhanced hybrid reconciliation completed")
+            
+            # Step 3: Generate final document
+            doc_generator = DocumentGenerator()
+            output_path = doc_generator.create_word_document_from_structured_document(
+                document=document,
+                output_path=os.path.join(output_dir, "translated_document.docx")
+            )
+            self.logger.info(f"Document generation completed: {output_path}")
+            
+            return output_path
+            
+        except Exception as e:
+            self.logger.error(f"Document processing failed: {e}")
+            raise
+
+    def _setup_components(self):
+        """Set up workflow components with enhanced configuration"""
+        try:
+            # Initialize Nougat processor
+            self.nougat_processor = NougatIntegration(
+                config=self.config,
+                model_path=self.config.get('Nougat', 'model_path'),
+                device=self.config.get('Nougat', 'device')
+            )
+            
+            # Initialize YOLOv8 detector
+            self.yolo_detector = YOLOv8VisualDetector(
+                model_path=self.config.get('YOLOv8', 'model_path'),
+                confidence_threshold=0.5  # Higher threshold for better accuracy
+            )
+            
+            # Initialize document generator with visual content exclusion
+            self.doc_generator = DocumentGenerator(
+                config=self.config,
+                preserve_visual_content=True  # Ensure visual content is preserved
+            )
+            
+            self.logger.info("Workflow components initialized successfully")
+            
+        except Exception as e:
+            self.logger.error(f"Component initialization failed: {e}")
+            raise
 
 async def main():
     """Main entry point for the application"""

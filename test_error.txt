@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "C:\Users\30694\gemini_translator_env\simple_test.py", line 45, in <module>
+    from pdf_parser_enhanced import enhanced_pdf_parser
+  File "C:\Users\30694\gemini_translator_env\pdf_parser_enhanced.py", line 42
+    'table of contents', 'contents', 'index', 'table des mati�res',
+                                                                ^
+SyntaxError: (unicode error) 'utf-8' codec can't decode byte 0xe8 in position 14: invalid continuation byte

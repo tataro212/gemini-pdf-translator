@@ -26,6 +26,11 @@ class GoogleDriveUploader:
             # Check if required files exist
             if not os.path.exists("client_secrets.json"):
                 logger.warning("Google Drive upload not available. 'client_secrets.json' not found.")
+                logger.info("To enable Google Drive upload:")
+                logger.info("1. Go to https://console.cloud.google.com")
+                logger.info("2. Create a project and enable the Google Drive API")
+                logger.info("3. Create OAuth 2.0 credentials and download as client_secrets.json")
+                logger.info("4. Place client_secrets.json in the project root directory")
                 return
             
             # Try to import and initialize PyDrive2
@@ -34,6 +39,9 @@ class GoogleDriveUploader:
             
             # Authenticate
             gauth = GoogleAuth()
+            
+            # Set OAuth access type to offline
+            gauth.settings['get_refresh_token'] = True
             
             # Try to load saved credentials
             if os.path.exists(self.credentials_file):
@@ -62,6 +70,10 @@ class GoogleDriveUploader:
             logger.warning("PyDrive2 not available. Install with: pip install PyDrive2")
         except Exception as e:
             logger.error(f"Failed to initialize Google Drive: {e}")
+            logger.info("If you see 'No refresh_token found', make sure to:")
+            logger.info("1. Delete mycreds.txt if it exists")
+            logger.info("2. Set 'get_refresh_token = True' in your client_secrets.json")
+            logger.info("3. Run the script again to re-authenticate")
     
     def upload_to_google_drive(self, filepath_to_upload, filename_on_drive, gdrive_folder_id=None):
         """Upload file to Google Drive"""

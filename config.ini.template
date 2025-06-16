@@ -36,6 +36,14 @@ image_quality_threshold = 0.7
 # Enable advanced visual content processing with Nougat
 enable_nougat_processing = True
 
+[GoogleDrive]
+# Enable Google Drive upload functionality
+enable_drive_upload = False
+# ID of the target folder in Google Drive (leave empty to use root folder)
+gdrive_target_folder_id = 
+# Path to store OAuth credentials (relative to project root)
+credentials_file = mycreds.txt
+
 [Advanced]
 # Enable debug logging
 debug_mode = False

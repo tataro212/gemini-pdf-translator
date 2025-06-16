@@ -535,34 +535,31 @@ class PDFParser:
         return equation_areas
 
     def _simple_visual_detection(self, page, page_num):
-        """Simple and effective visual detection - capture areas with any visual content"""
+        """Simple and effective visual detection - identify areas to exclude from translation"""
         visual_areas = []
 
         try:
             page_rect = page.rect
 
-            # Method 1: Check for vector drawings (be more selective to avoid text formatting)
+            # Method 1: Check for vector drawings
             drawings = page.get_drawings()
-            if len(drawings) >= 5:  # Require more drawings to avoid text formatting elements
-                # ENHANCED: Check if this is actually visual content, not just formatted text
-                if self._has_substantial_visual_content(page, drawings):
-                    # Create a large area covering most of the page
-                    padding = 30
-                    bbox = [
-                        padding,
-                        padding,
-                        page_rect.width - padding,
-                        page_rect.height - padding
-                    ]
+            if len(drawings) >= 3:  # Lower threshold since we're excluding these areas
+                # Create a large area covering most of the page
+                padding = 30
+                bbox = [
+                    padding,
+                    padding,
+                    page_rect.width - padding,
+                    page_rect.height - padding
+                ]
 
-                    visual_areas.append({
-                        'bbox': bbox,
-                        'content_type': 'page_with_drawings',
-                        'confidence': 0.8
-                    })
-                    logger.debug(f"Page {page_num + 1}: Found {len(drawings)} substantial drawings, capturing full page area")
-                else:
-                    logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawings but they appear to be text formatting elements")
+                visual_areas.append({
+                    'bbox': bbox,
+                    'content_type': 'page_with_drawings',
+                    'exclude_from_translation': True,  # Flag to exclude from translation
+                    'confidence': 0.9
+                })
+                logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawings, excluding from translation")
 
             # Method 2: Check for raster images
             images = page.get_images(full=True)
@@ -586,9 +583,10 @@ class PDFParser:
                                 visual_areas.append({
                                     'bbox': bbox,
                                     'content_type': 'image_area',
-                                    'confidence': 0.9
+                                    'exclude_from_translation': True,  # Flag to exclude from translation
+                                    'confidence': 0.95
                                 })
-                                logger.debug(f"Page {page_num + 1}: Found raster image, capturing area with padding")
+                                logger.debug(f"Page {page_num + 1}: Found raster image, excluding from translation")
                     except:
                         continue
 
@@ -620,9 +618,10 @@ class PDFParser:
                         visual_areas.append({
                             'bbox': bbox,
                             'content_type': 'sparse_text_page',
-                            'confidence': 0.5
+                            'exclude_from_translation': True,  # Flag to exclude from translation
+                            'confidence': 0.8
                         })
-                        logger.debug(f"Page {page_num + 1}: Low text coverage ({text_coverage:.2f}), might have visual content")
+                        logger.debug(f"Page {page_num + 1}: Low text coverage ({text_coverage:.2f}), excluding from translation")
 
         except Exception as e:
             logger.warning(f"Error in simple visual detection: {e}")
@@ -3691,3 +3690,144 @@ class StructuredContentExtractor:
         
         import re
         return any(re.match(pattern, text.lower()) for pattern in page_patterns)
+
+    def extract_text(self, page_num):
+        """Extract text from page while excluding visual content areas"""
+        try:
+            page = self.pdf_document[page_num]
+            visual_areas = self._simple_visual_detection(page, page_num)
+            
+            # Get all text blocks
+            text_blocks = page.get_text("dict")["blocks"]
+            text_blocks = [b for b in text_blocks if "lines" in b]
+            
+            # Filter out text blocks that overlap with visual areas
+            filtered_blocks = []
+            for block in text_blocks:
+                block_bbox = block["bbox"]
+                should_exclude = False
+                
+                for visual_area in visual_areas:
+                    if self._bboxes_overlap(block_bbox, visual_area['bbox']):
+                        should_exclude = True
+                        logger.debug(f"Excluding text block from page {page_num + 1} due to overlap with visual content")
+                        break
+                
+                if not should_exclude:
+                    filtered_blocks.append(block)
+            
+            # Extract text from filtered blocks
+            text = ""
+            for block in filtered_blocks:
+                for line in block["lines"]:
+                    for span in line["spans"]:
+                        text += span["text"] + " "
+                    text += "\n"
+                text += "\n"
+            
+            return text.strip()
+            
+        except Exception as e:
+            logger.error(f"Error extracting text with exclusions: {e}")
+            return ""
+
+    def _bboxes_overlap(self, bbox1, bbox2):
+        """Check if two bounding boxes overlap"""
+        return not (bbox1[2] < bbox2[0] or  # bbox1 is left of bbox2
+                   bbox1[0] > bbox2[2] or  # bbox1 is right of bbox2
+                   bbox1[3] < bbox2[1] or  # bbox1 is above bbox2
+                   bbox1[1] > bbox2[3])    # bbox1 is below bbox2
+
+    def _simple_visual_detection(self, page, page_num):
+        """Simple and effective visual detection - identify areas to exclude from translation"""
+        visual_areas = []
+
+        try:
+            page_rect = page.rect
+
+            # Method 1: Check for vector drawings
+            drawings = page.get_drawings()
+            if len(drawings) >= 3:  # Lower threshold since we're excluding these areas
+                # Create a large area covering most of the page
+                padding = 30
+                bbox = [
+                    padding,
+                    padding,
+                    page_rect.width - padding,
+                    page_rect.height - padding
+                ]
+
+                visual_areas.append({
+                    'bbox': bbox,
+                    'content_type': 'page_with_drawings',
+                    'exclude_from_translation': True,  # Flag to exclude from translation
+                    'confidence': 0.9
+                })
+                logger.debug(f"Page {page_num + 1}: Found {len(drawings)} drawings, excluding from translation")
+
+            # Method 2: Check for raster images
+            images = page.get_images(full=True)
+            if images:
+                for img in images:
+                    try:
+                        xref = img[0]
+                        img_rects = page.get_image_rects(xref)
+
+                        if img_rects:
+                            for rect in img_rects:
+                                # Create generous area around image
+                                padding = 150  # Very generous padding
+                                bbox = [
+                                    max(0, rect.x0 - padding),
+                                    max(0, rect.y0 - padding),
+                                    min(page_rect.width, rect.x1 + padding),
+                                    min(page_rect.height, rect.y1 + padding)
+                                ]
+
+                                visual_areas.append({
+                                    'bbox': bbox,
+                                    'content_type': 'image_area',
+                                    'exclude_from_translation': True,  # Flag to exclude from translation
+                                    'confidence': 0.95
+                                })
+                                logger.debug(f"Page {page_num + 1}: Found raster image, excluding from translation")
+                    except:
+                        continue
+
+            # Method 3: Check for pages with low text density (might have visual content)
+            if not visual_areas:  # Only if we haven't found anything else
+                text_blocks = page.get_text("dict")["blocks"]
+                text_blocks = [b for b in text_blocks if "lines" in b]
+
+                if text_blocks:
+                    total_text_area = 0
+                    for block in text_blocks:
+                        bbox = block["bbox"]
+                        block_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+                        total_text_area += block_area
+
+                    page_area = page_rect.width * page_rect.height
+                    text_coverage = total_text_area / page_area
+
+                    # If very low text coverage, might have visual content
+                    if text_coverage < 0.2:  # Less than 20% text
+                        padding = 50
+                        bbox = [
+                            padding,
+                            padding,
+                            page_rect.width - padding,
+                            page_rect.height - padding
+                        ]
+
+                        visual_areas.append({
+                            'bbox': bbox,
+                            'content_type': 'sparse_text_page',
+                            'exclude_from_translation': True,  # Flag to exclude from translation
+                            'confidence': 0.8
+                        })
+                        logger.debug(f"Page {page_num + 1}: Low text coverage ({text_coverage:.2f}), excluding from translation")
+
+        except Exception as e:
+            logger.warning(f"Error in simple visual detection: {e}")
+
+        return visual_areas

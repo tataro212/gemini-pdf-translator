@@ -1,0 +1,15 @@
+=== SIMPLE TEST FOR ENHANCED PDF TRANSLATOR ===
+Testing basic Python functionality...
+Python version: 3.11.13 | packaged by Anaconda, Inc. | (main, Jun  5 2025, 13:03:15) [MSC v.1929 64 bit (AMD64)]
+Python executable: C:\Users\30694\Miniconda3\envs\nougat_env\python.exe
+
+Testing basic imports...
+PASS: os module imported
+PASS: logging module imported
+PASS: asyncio module imported
+FAIL: python-docx import failed: No module named 'docx'
+
+Testing enhanced components...
+FAIL: Enhanced document generator import failed: No module named 'docx'
+FAIL: Enhanced translation service import failed: No module named 'google'
+ERROR: (unicode error) 'utf-8' codec can't decode byte 0xe8 in position 14: invalid continuation byte (pdf_parser_enhanced.py, line 42)
