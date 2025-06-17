@@ -243,6 +243,7 @@ class Document:
     title: str = ""
     pages: List[Page] = field(default_factory=list)
     document_metadata: Dict[str, Any] = field(default_factory=dict)
+    toc_entries: List[Dict[str, Any]] = field(default_factory=list)
     
     def add_page(self, page: Page) -> None:
         """Add a page to the document"""
@@ -255,12 +256,19 @@ class Document:
             headings.extend(page.get_headings())
         return headings
     
-    def get_all_footnotes(self) -> List[Footnote]:
-        """Get all footnotes from all pages"""
-        footnotes = []
-        for page in self.pages:
-            footnotes.extend(page.get_footnotes())
-        return footnotes
+    def get_toc_entries(self) -> List[Dict[str, Any]]:
+        """Get all TOC entries, preserving their structure"""
+        return self.toc_entries
+    
+    def update_toc_entries(self, entries: List[Dict[str, Any]]) -> None:
+        """Update TOC entries, preserving their structure"""
+        self.toc_entries = entries
+    
+    def translate_toc_entries(self, translation_map: Dict[str, str]) -> None:
+        """Translate TOC entries while preserving their structure"""
+        for entry in self.toc_entries:
+            if entry['text'] in translation_map:
+                entry['text'] = translation_map[entry['text']]
     
     def get_all_content_blocks(self) -> List[ContentBlock]:
         """Get all content blocks from all pages in order"""
@@ -275,10 +283,11 @@ class Document:
             'title': self.title,
             'pages': [page.to_dict() for page in self.pages],
             'document_metadata': self.document_metadata,
+            'toc_entries': self.toc_entries,
             'total_pages': len(self.pages),
             'total_blocks': len(self.get_all_content_blocks()),
             'total_headings': len(self.get_all_headings()),
-            'total_footnotes': len(self.get_all_footnotes())
+            'total_toc_entries': len(self.toc_entries)
         }
     
     def get_statistics(self) -> Dict[str, int]:

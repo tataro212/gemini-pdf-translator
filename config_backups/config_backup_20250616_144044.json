@@ -1,0 +1,52 @@
+{
+  "general": {
+    "target_language": "Spanish",
+    "nougat_only_mode": false,
+    "use_advanced_features": true,
+    "debug_mode": false
+  },
+  "performance": {
+    "max_parallel_workers": 4,
+    "enable_parallel_processing": true,
+    "chunk_size": 1000,
+    "max_memory_usage_mb": 2048
+  },
+  "monitoring": {
+    "enable_structured_metrics": true,
+    "enable_distributed_tracing": true,
+    "log_level": "INFO",
+    "metrics_output_file": null
+  },
+  "pdf_processing": {
+    "extract_cover_page": true,
+    "extract_images": true,
+    "image_quality_threshold": 0.7,
+    "max_image_size_mb": 10,
+    "ocr_confidence_threshold": 0.8
+  },
+  "translation": {
+    "service_provider": "gemini",
+    "api_key": null,
+    "model_name": "gemini-2.0-flash-exp",
+    "max_tokens_per_request": 4000,
+    "temperature": 0.3,
+    "enable_caching": true
+  },
+  "quarantine": {
+    "max_retries": 3,
+    "quarantine_directory": "quarantine",
+    "auto_cleanup_days": 30
+  },
+  "intelligent_pipeline": {
+    "use_intelligent_pipeline": true,
+    "max_concurrent_tasks": 4,
+    "content_analysis_depth": "medium"
+  },
+  "yolo_integration": {
+    "enable_yolo": true,
+    "yolo_service_url": "http://localhost:8000",
+    "confidence_threshold": 0.5,
+    "use_yolo_for_layout": true,
+    "fallback_on_failure": true
+  }
+}

@@ -1,47 +1,62 @@
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import letter
-from reportlab.lib import colors
-import os
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.units import inch
 
-def create_test_pdf():
-    # Create output directory if it doesn't exist
-    os.makedirs("test_output", exist_ok=True)
-    
+def create_test_pdf(filename):
     # Create a new PDF with ReportLab
-    c = canvas.Canvas("test.pdf", pagesize=letter)
-    width, height = letter
+    doc = SimpleDocTemplate(filename, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
     
-    # Add title
-    c.setFont("Helvetica-Bold", 24)
-    c.drawString(100, height - 100, "Test PDF Document")
+    # Add Table of Contents
+    toc_style = styles['Heading1']
+    toc_style.fontSize = 16
+    toc_style.spaceAfter = 12
+    story.append(Paragraph("Table of Contents", toc_style))
+    story.append(Spacer(1, 0.2*inch))
     
-    # Add some text
-    c.setFont("Helvetica", 12)
-    c.drawString(100, height - 150, "This is a test document for the PDF parser.")
+    # Add TOC entries
+    toc_entries = [
+        "Chapter 1: Introduction ................... 1",
+        "1.1 Background ............................ 2",
+        "1.2 Objectives ............................ 3",
+        "Chapter 2: Literature Review .............. 4",
+        "2.1 Previous Work ........................ 5",
+        "2.2 Current State ........................ 6"
+    ]
     
-    # Add a blue rectangle
-    c.setFillColor(colors.blue)
-    c.rect(100, height - 250, 200, 50, fill=1)
+    for entry in toc_entries:
+        story.append(Paragraph(entry, styles['Normal']))
+        story.append(Spacer(1, 0.1*inch))
     
-    # Add text about the rectangle
-    c.setFillColor(colors.black)
-    c.drawString(100, height - 270, "This is a blue rectangle in the document.")
+    # Add main content
+    story.append(Paragraph("Chapter 1: Introduction", styles['Heading1']))
+    story.append(Spacer(1, 0.2*inch))
     
-    # Add a table-like structure
-    c.setStrokeColor(colors.black)
-    c.line(100, height - 350, 300, height - 350)  # Top line
-    c.line(100, height - 400, 300, height - 400)  # Bottom line
-    c.line(100, height - 350, 100, height - 400)  # Left line
-    c.line(300, height - 350, 300, height - 400)  # Right line
-    c.line(200, height - 350, 200, height - 400)  # Middle line
+    story.append(Paragraph("1.1 Background", styles['Heading2']))
+    story.append(Paragraph("This is the background section.", styles['Normal']))
+    story.append(Spacer(1, 0.2*inch))
     
-    # Add table headers
-    c.drawString(120, height - 370, "Column 1")
-    c.drawString(220, height - 370, "Column 2")
+    story.append(Paragraph("1.2 Objectives", styles['Heading2']))
+    story.append(Paragraph("These are the objectives.", styles['Normal']))
+    story.append(Spacer(1, 0.2*inch))
     
-    # Save the PDF
-    c.save()
-    print("Test PDF created successfully!")
+    story.append(Paragraph("Chapter 2: Literature Review", styles['Heading1']))
+    story.append(Spacer(1, 0.2*inch))
+    
+    story.append(Paragraph("2.1 Previous Work", styles['Heading2']))
+    story.append(Paragraph("This section discusses previous work.", styles['Normal']))
+    story.append(Spacer(1, 0.2*inch))
+    
+    story.append(Paragraph("2.2 Current State", styles['Heading2']))
+    story.append(Paragraph("This section discusses the current state.", styles['Normal']))
+    
+    # Build the PDF
+    doc.build(story)
 
 if __name__ == "__main__":
-    create_test_pdf() 
+    create_test_pdf("test.pdf") 

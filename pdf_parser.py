@@ -17,6 +17,8 @@ from structured_document_model import (
     Table, CodeBlock, ListItem, Footnote, Equation, Caption, Metadata,
     convert_legacy_structured_content_to_document, create_content_block_from_legacy
 )
+from typing import List, Dict, Any, Optional
+from difflib import SequenceMatcher
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +27,24 @@ class PDFParser:
     
     def __init__(self):
         self.settings = config_manager.pdf_processing_settings
-        
+        self.toc_compiled_patterns = [
+            re.compile(r'^Table of Contents$', re.IGNORECASE),
+            re.compile(r'^Contents$', re.IGNORECASE),
+            re.compile(r'^Index$', re.IGNORECASE),
+            re.compile(r'^Table des matières$', re.IGNORECASE),
+            re.compile(r'^Inhalt$', re.IGNORECASE),
+            re.compile(r'^Sommaire$', re.IGNORECASE)
+        ]
+        self.toc_structure_patterns = [
+            re.compile(r'\.{3,}\s*\d+$'),  # Dots followed by page number
+            re.compile(r'^\d+\.\d+\s+[A-Z]'),  # Numbered sections
+            re.compile(r'^[A-Z][a-z]+\s+\d+$'),  # Chapter names with numbers
+            re.compile(r'^\d+\.\s+[A-Z]'),  # Simple numbered sections
+            re.compile(r'^[IVX]+\.\s+[A-Z]')  # Roman numerals
+        ]
+        self.min_image_size = (8, 8)  # Updated minimum image size threshold
+        self.figure_pattern = re.compile(r'^(?:Figure|Fig\.?|Diagram|Schema)\s+\d+(?:\.\d+)?', re.IGNORECASE)
+
     def extract_images_from_pdf(self, pdf_filepath, output_image_folder):
         """Extract images from PDF and save to folder"""
         if not self.settings['extract_images']:
@@ -1626,6 +1645,545 @@ class PDFParser:
             logger.warning(f"Could not render {area_type} area: {e}")
             return None
 
+    def detect_document_structure(self, doc):
+        """
+        Enhanced document structure detection with multi-factor analysis.
+        
+        Args:
+            doc: PyMuPDF document object
+            
+        Returns:
+            dict: Document structure information including:
+                - toc_pages: List of page numbers containing TOC
+                - content_start_page: First page of main content
+                - heading_hierarchy: Dict mapping heading levels to styles
+                - section_boundaries: List of section start/end pages
+                - document_parts: Dict identifying different document parts
+        """
+        structure_info = {
+            'toc_pages': [],
+            'content_start_page': 0,
+            'heading_hierarchy': {},
+            'section_boundaries': [],
+            'document_parts': {
+                'front_matter': [],
+                'main_content': [],
+                'back_matter': []
+            },
+            'font_analysis': self._analyze_fonts(doc),
+            'spatial_analysis': self._analyze_spatial_layout(doc)
+        }
+        
+        # First pass: Identify document parts and TOC
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_text = page.get_text()
+            
+            # Check for TOC
+            if self._is_toc_page(page, page_text):
+                structure_info['toc_pages'].append(page_num)
+                structure_info['document_parts']['front_matter'].append(page_num)
+                continue
+                
+            # Check for content start
+            if not structure_info['content_start_page'] and self._is_content_start(page, page_text):
+                structure_info['content_start_page'] = page_num
+                structure_info['document_parts']['main_content'].append(page_num)
+                continue
+                
+            # Check for back matter
+            if self._is_back_matter(page, page_text):
+                structure_info['document_parts']['back_matter'].append(page_num)
+                continue
+                
+            # Default to main content
+            structure_info['document_parts']['main_content'].append(page_num)
+            
+        # Second pass: Analyze heading hierarchy
+        structure_info['heading_hierarchy'] = self._analyze_heading_hierarchy(doc, structure_info)
+        
+        # Third pass: Identify section boundaries
+        structure_info['section_boundaries'] = self._identify_section_boundaries(doc, structure_info)
+        
+        return structure_info
+        
+    def _is_toc_page(self, page, page_text):
+        """
+        Enhanced TOC page detection with multiple indicators and scoring system.
+        Returns True if the page is likely a Table of Contents page.
+        """
+        if not page_text:
+            return False
+            
+        text_lower = page_text.lower()
+        lines = page_text.split('\n')
+        toc_score = 0
+        
+        # 1. Check for TOC title patterns
+        for pattern in self.toc_compiled_patterns:
+            if pattern.search(page_text):
+                toc_score += 3  # Strong indicator
+                break
+                
+        # 2. Check for TOC-like structure
+        structure_indicators = 0
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check each structure pattern
+            for pattern in self.toc_structure_patterns:
+                if pattern.search(line):
+                    structure_indicators += 1
+                    break
+                    
+            # Check for dot leaders with page numbers
+            if re.search(r'\.{3,}\s*\d+$', line):
+                structure_indicators += 1
+                
+        # Add structure score (capped at 3 points)
+        toc_score += min(structure_indicators, 3)
+        
+        # 3. Check for page number patterns
+        page_number_patterns = [
+            r'\.{3,}\s*\d+',  # dots followed by page numbers
+            r'\d+\s*\.{3,}',  # page numbers followed by dots
+            r'^\s*\d+\s*$',   # standalone page numbers
+            r'\d+\s*\n'       # numbers at end of lines
+        ]
+        
+        page_number_matches = sum(1 for pattern in page_number_patterns 
+                                if re.search(pattern, text_lower, re.MULTILINE))
+        toc_score += min(page_number_matches, 2)  # Cap at 2 points
+        
+        # 4. Check for repetitive short lines (typical of TOC structure)
+        short_lines = sum(1 for line in lines if 3 <= len(line.strip()) <= 60)
+        if len(lines) > 5 and short_lines / len(lines) > 0.6:
+            toc_score += 2
+            
+        # 5. Check for common TOC keywords
+        toc_keywords = [
+            'chapter', 'section', 'part', 'appendix',
+            'introduction', 'conclusion', 'references'
+        ]
+        keyword_matches = sum(1 for keyword in toc_keywords if keyword in text_lower)
+        toc_score += min(keyword_matches, 2)  # Cap at 2 points
+        
+        # Determine if this is a TOC page (threshold of 5 points)
+        is_toc = toc_score >= 5
+        
+        if is_toc:
+            logger.info(f"Page identified as TOC (score: {toc_score})")
+            
+        return is_toc
+        
+    def _is_content_start(self, page, page_text):
+        """Detect the start of main content"""
+        # Common indicators of content start
+        content_start_indicators = [
+            r'^Chapter\s+\d+',
+            r'^Introduction',
+            r'^Abstract',
+            r'^Executive Summary',
+            r'^1\.\s+[A-Z]'  # First numbered section
+        ]
+        
+        for pattern in content_start_indicators:
+            if re.search(pattern, page_text, re.MULTILINE):
+                return True
+                
+        return False
+        
+    def _is_back_matter(self, page, page_text):
+        """Detect back matter sections"""
+        back_matter_indicators = [
+            r'^References',
+            r'^Bibliography',
+            r'^Appendix',
+            r'^Index',
+            r'^Glossary'
+        ]
+        
+        for pattern in back_matter_indicators:
+            if re.search(pattern, page_text, re.MULTILINE):
+                return True
+                
+        return False
+        
+    def _analyze_fonts(self, doc):
+        """Analyze font usage across the document"""
+        font_info = {
+            'font_sizes': defaultdict(int),
+            'font_families': defaultdict(int),
+            'font_styles': defaultdict(int)
+        }
+        
+        for page in doc:
+            for block in page.get_text("dict")["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            font_info['font_sizes'][span.get("size", 0)] += 1
+                            font_info['font_families'][span.get("font", "")] += 1
+                            font_info['font_styles'][span.get("flags", 0)] += 1
+                            
+        return font_info
+        
+    def _analyze_spatial_layout(self, doc):
+        """Analyze spatial layout patterns"""
+        layout_info = {
+            'column_count': defaultdict(int),
+            'margins': [],
+            'content_areas': []
+        }
+        
+        for page in doc:
+            page_rect = page.rect
+            blocks = page.get_text("dict")["blocks"]
+            
+            # Analyze column structure
+            x_positions = set()
+            for block in blocks:
+                if "bbox" in block:
+                    x_positions.add(block["bbox"][0])  # Left edge
+                    x_positions.add(block["bbox"][2])  # Right edge
+                    
+            layout_info['column_count'][len(x_positions)] += 1
+            
+            # Record content areas
+            for block in blocks:
+                if "bbox" in block:
+                    layout_info['content_areas'].append(block["bbox"])
+                    
+        return layout_info
+        
+    def _analyze_heading_hierarchy(self, doc, structure_info):
+        """Analyze and establish heading hierarchy"""
+        heading_styles = defaultdict(list)
+        
+        for page_num in range(len(doc)):  # Changed to analyze all pages
+            page = doc[page_num]
+            blocks = page.get_text("dict")["blocks"]
+            
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = span.get("text", "").strip()
+                            if self._is_heading_candidate(text, span):
+                                heading_styles[span.get("size", 0)].append({
+                                    'text': text,
+                                    'font': span.get("font", ""),
+                                    'flags': span.get("flags", 0),
+                                    'page': page_num
+                                })
+                                
+        # Establish heading levels based on font size and style
+        heading_hierarchy = {}
+        sorted_sizes = sorted(heading_styles.keys(), reverse=True)
+        
+        # Ensure we have at least 3 heading levels
+        if len(sorted_sizes) < 3:
+            # Create artificial heading levels if needed
+            base_size = max(sorted_sizes) if sorted_sizes else 16
+            sorted_sizes = [base_size, base_size * 0.8, base_size * 0.6]
+        
+        for i, size in enumerate(sorted_sizes):
+            heading_hierarchy[f'h{i+1}'] = {
+                'font_size': size,
+                'examples': heading_styles.get(size, [])[:3]  # Keep first 3 examples
+            }
+            
+        return heading_hierarchy
+        
+    def _is_heading_candidate(self, text, span):
+        """Determine if text is likely a heading"""
+        if not text or len(text) > 200:  # Too long for a heading
+            return False
+            
+        # Check font characteristics
+        is_bold = bool(span.get("flags", 0) & 16)
+        font_size = span.get("size", 0)
+        
+        # Check text patterns
+        heading_patterns = [
+            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$',  # Title case
+            r'^\d+\.\s+[A-Z]',  # Numbered sections
+            r'^[IVX]+\.\s+[A-Z]',  # Roman numerals
+            r'^[A-Z]\.\s+[A-Z]',  # Lettered sections
+            r'^Chapter\s+\d+',  # Chapter headings
+            r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+\d+$'  # Title with number
+        ]
+        
+        for pattern in heading_patterns:
+            if re.match(pattern, text):
+                return True
+                
+        # Also consider font size and style
+        if is_bold and font_size > 12:  # Bold and larger than normal text
+            return True
+                
+        return False
+        
+    def _identify_section_boundaries(self, doc, structure_info):
+        """Identify section boundaries based on heading patterns"""
+        section_boundaries = []
+        current_section = None
+        
+        for page_num in structure_info['document_parts']['main_content']:
+            page = doc[page_num]
+            blocks = page.get_text("dict")["blocks"]
+            
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = span.get("text", "").strip()
+                            if self._is_heading_candidate(text, span):
+                                if current_section:
+                                    current_section['end_page'] = page_num - 1
+                                    section_boundaries.append(current_section)
+                                    
+                                current_section = {
+                                    'start_page': page_num,
+                                    'heading': text,
+                                    'level': self._determine_heading_level(span, structure_info)
+                                }
+                                
+        # Add the last section
+        if current_section:
+            current_section['end_page'] = len(doc) - 1
+            section_boundaries.append(current_section)
+            
+        return section_boundaries
+        
+    def _determine_heading_level(self, span, structure_info):
+        """Determine heading level based on font characteristics"""
+        font_size = span.get("size", 0)
+        
+        for level, info in structure_info['heading_hierarchy'].items():
+            if abs(font_size - info['font_size']) < 0.5:  # Allow small font size differences
+                return int(level[1])  # Extract number from 'h1', 'h2', etc.
+                
+        return 1  # Default to level 1 if no match found
+
+    def extract_toc_from_content_two_pass(self, doc=None, structure_info=None, content=None) -> List[Dict[str, Any]]:
+        """
+        Robust two-pass ToC extraction that combines document structure analysis with content parsing.
+        
+        Args:
+            doc: PyMuPDF document object (optional)
+            structure_info: Pre-computed document structure (optional)
+            content: Raw text content (optional)
+            
+        Returns:
+            List of TOC entries with structure: {
+                'title': str,
+                'page': int,
+                'level': int,
+                'source': str,
+                'confidence': float
+            }
+        """
+        toc_entries = []
+        
+        # --- Pass 1: Extract from document structure if available ---
+        if doc is not None:
+            if structure_info is None:
+                structure_info = self.detect_document_structure(doc)
+                
+            # 1A. Extract from explicit TOC pages
+            toc_page_numbers = structure_info.get('toc_pages', [])
+            for page_num in toc_page_numbers:
+                page = doc[page_num]
+                page_text = page.get_text()
+                lines = page_text.split('\n')
+                
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                        
+                    # Pattern: "Title .......... 5"
+                    m = re.match(r'^(.+?)\s*\.{3,}\s*(\d+)$', line)
+                    if m:
+                        title = m.group(1).strip()
+                        page_ref = int(m.group(2))
+                        toc_entries.append({
+                            'title': title,
+                            'page': page_ref,
+                            'level': 1,  # Default, will refine in pass 2
+                            'source': 'toc_page_chapter',  # Updated source field
+                            'confidence': 0.9
+                        })
+                        continue
+                        
+                    # Pattern: "1.1 Section Title   7"
+                    m2 = re.match(r'^(\d+(?:\.\d+)*)(?:\s+)(.+?)\s+(\d+)$', line)
+                    if m2:
+                        number = m2.group(1)
+                        title = m2.group(2).strip()
+                        page_ref = int(m2.group(3))
+                        level = number.count('.') + 1
+                        toc_entries.append({
+                            'title': f"{number} {title}",
+                            'page': page_ref,
+                            'level': level,
+                            'source': 'toc_page_numbered',
+                            'confidence': 0.95
+                        })
+                        continue
+                        
+                    # Pattern: "Chapter 1: Title"
+                    m3 = re.match(r'^(?:Chapter|Section)\s+(\d+)(?::\s*)(.+)$', line, re.IGNORECASE)
+                    if m3:
+                        number = m3.group(1)
+                        title = m3.group(2).strip()
+                        toc_entries.append({
+                            'title': f"Chapter {number}: {title}",
+                            'page': None,  # Will be filled in pass 2
+                            'level': 1,
+                            'source': 'toc_page_chapter',
+                            'confidence': 0.85
+                        })
+            
+            # 1B. Extract from heading structure
+            section_boundaries = structure_info.get('section_boundaries', [])
+            for section in section_boundaries:
+                heading = section.get('heading')
+                page = section.get('start_page')
+                level = section.get('level', 1)
+                if heading and page is not None:
+                    toc_entries.append({
+                        'title': heading,
+                        'page': page + 1,  # Convert to 1-based page
+                        'level': level,
+                        'source': 'heading_structure',
+                        'confidence': 0.8
+                    })
+        
+        # --- Pass 2: Extract from content if available ---
+        if content:
+            lines = content.split('\n')
+            for line in lines:
+                line = line.strip()
+                if not line or len(line) < 3:
+                    continue
+                
+                # Skip lines that are clearly not TOC entries
+                if line.startswith('Chapter') or line.startswith('Section'):
+                    continue
+                
+                # Skip lines that are only Markdown underlines (e.g., '===', '---')
+                if re.match(r'^[=\-]+$', line):
+                    continue
+                
+                # Try to detect heading level and text
+                level = 1
+                text = line
+                
+                # Check for common heading patterns
+                if line.startswith('#'):
+                    level = len(re.match(r'^#+', line).group())
+                    text = line[level:].strip()
+                elif re.match(r'^\d+\.', line):
+                    level = 2
+                    text = re.sub(r'^\d+\.\s*', '', line)
+                elif re.match(r'^[A-Z]\.', line):
+                    level = 3
+                    text = re.sub(r'^[A-Z]\.\s*', '', line)
+                
+                # Skip if text is too short after cleaning
+                if len(text) < 3:
+                    continue
+                
+                # Skip if too similar to existing entries
+                if any(self._is_similar_to_previous(text, entry['title']) for entry in toc_entries):
+                    continue
+                
+                toc_entries.append({
+                    'title': text,
+                    'page': None,  # Will be filled in pass 3
+                    'level': level,
+                    'source': 'content_analysis',
+                    'confidence': 0.7
+                })
+        
+        # --- Pass 3: Reconcile and refine entries ---
+        # 3A. Normalize and deduplicate by canonical headings
+        canonical_headings = {'introduction', 'background', 'methods', 'history', 'current state'}
+        seen_titles = set()
+        refined_entries = []
+        
+        for entry in sorted(toc_entries, key=lambda x: (len(x['title']), -x['confidence'])):
+            title_lower = entry['title'].lower()
+            # Extract canonical heading if present
+            canonical = None
+            for heading in canonical_headings:
+                if heading in title_lower:
+                    canonical = heading
+                    break
+            if canonical:
+                title_lower = canonical
+            # Limit the title to a maximum of 16 words
+            words = title_lower.split()
+            if len(words) > 16:
+                title_lower = ' '.join(words[:16])
+            # Skip if this is a substring of any seen title
+            if any(title_lower in seen_title for seen_title in seen_titles):
+                continue
+            # If any seen title is a substring of this, remove the longer one
+            to_remove = [seen_title for seen_title in seen_titles if seen_title in title_lower]
+            for rem in to_remove:
+                seen_titles.remove(rem)
+                refined_entries = [e for e in refined_entries if e['title'].lower() != rem]
+            seen_titles.add(title_lower)
+            refined_entries.append(entry)
+        # 3B. Sort by page number (if available) and level
+        refined_entries.sort(key=lambda x: (
+            x['page'] if x['page'] is not None else float('inf'),
+            x['level']
+        ))
+        # 3C. Fill in missing page numbers based on order
+        current_page = 1
+        for entry in refined_entries:
+            if entry['page'] is None:
+                entry['page'] = current_page
+            current_page = entry['page'] + 1
+        return refined_entries
+
+    def _is_similar_to_previous(self, text1: str, text2: str, threshold: float = 0.8) -> bool:
+        """Check if two texts are similar using Levenshtein distance."""
+        return SequenceMatcher(None, text1, text2).ratio() > threshold
+
+    def extract_structured_content_from_pdf(self, pdf_path: str, extracted_images: Optional[List[Dict[str, Any]]] = None) -> Document:
+        """
+        Extract structured content from PDF with enhanced TOC handling.
+        """
+        try:
+            # Extract raw content first
+            raw_content = self.extract_text_from_pdf(pdf_path)
+            
+            # Extract TOC using two-pass approach
+            toc_entries = self.extract_toc_from_content_two_pass(raw_content)
+            
+            # Create document with TOC entries
+            document = Document(
+                title=os.path.basename(pdf_path),
+                content_blocks=[],
+                metadata={'toc_entries': toc_entries}
+            )
+            
+            # Process content blocks
+            # ... existing content block processing code ...
+            
+            return document
+            
+        except Exception as e:
+            logger.error(f"Error extracting structured content: {e}")
+            raise
+
 class StructuredContentExtractor:
     """Extract structured content from PDF with enhanced parsing"""
     
@@ -1643,7 +2201,7 @@ class StructuredContentExtractor:
             doc = fitz.open(filepath)
 
             # Analyze document structure
-            structure_analysis = self._analyze_document_structure(doc)
+            structure_analysis = self.parser.detect_document_structure(doc)
 
             # Extract content with structure as Document object
             document = self._extract_content_as_document(doc, images_by_page, structure_analysis, filepath)
@@ -1708,15 +2266,19 @@ class StructuredContentExtractor:
 
     def _perform_global_font_analysis(self, doc):
         """
-        Proposition 3: Global Font Analysis for Adaptive Heading Detection
-
-        Performs comprehensive font analysis across the entire document to build
-        an adaptive style hierarchy based on the document's specific styling.
+        Enhanced global font analysis with statistical methods for adaptive heading detection.
+        
+        Uses multiple statistical measures to identify:
+        1. Body text characteristics (mode, mean, standard deviation)
+        2. Heading hierarchy based on statistical clustering
+        3. Font style patterns and their distribution
         """
-        logger.info("🔍 Performing global font analysis for adaptive heading detection...")
+        logger.info("🔍 Performing enhanced statistical font analysis...")
 
         font_styles = {}  # font_key -> count
         font_sizes = []
+        font_weights = defaultdict(int)  # Track font weights
+        font_families = defaultdict(int)  # Track font families
 
         # First pass: collect all font information
         for page_num in range(len(doc)):
@@ -1739,46 +2301,97 @@ class StructuredContentExtractor:
                             style_key = f"{font_name}, {font_size:.1f}pt"
                             if is_bold:
                                 style_key += ", bold"
+                                font_weights['bold'] += 1
                             if is_italic:
                                 style_key += ", italic"
+                                font_weights['italic'] += 1
 
                             # Count occurrences
                             font_styles[style_key] = font_styles.get(style_key, 0) + 1
                             font_sizes.append(font_size)
+                            font_families[font_name] += 1
 
-        # Analyze font frequency to identify body text and headings
+        # Statistical analysis of font sizes
         from collections import Counter
-        style_counter = Counter(font_styles)
+        import numpy as np
+        from scipy import stats
+
+        # Convert to numpy array for statistical analysis
+        font_sizes_array = np.array(font_sizes)
+        
+        # Calculate basic statistics
+        mean_size = np.mean(font_sizes_array)
+        median_size = np.median(font_sizes_array)
+        std_size = np.std(font_sizes_array)
+        
+        # Use mode for body text size (more robust than mean for discrete values)
         size_counter = Counter(font_sizes)
-
-        # Identify the most common style as body text
-        body_text_style = style_counter.most_common(1)[0][0] if style_counter else "Arial, 12.0pt"
-        dominant_font_size = size_counter.most_common(1)[0][0] if size_counter else 12.0
-
-        # Build heading hierarchy based on font sizes larger than body text
-        heading_sizes = sorted([size for size in size_counter.keys() if size > dominant_font_size], reverse=True)
-
+        body_text_size = size_counter.most_common(1)[0][0]
+        
+        # Calculate size clusters using KDE (Kernel Density Estimation)
+        kde = stats.gaussian_kde(font_sizes_array)
+        x_range = np.linspace(min(font_sizes_array), max(font_sizes_array), 100)
+        density = kde(x_range)
+        
+        # Find peaks in the density plot (potential heading sizes)
+        from scipy.signal import find_peaks
+        peaks, _ = find_peaks(density, height=0.1*np.max(density))
+        potential_heading_sizes = sorted(x_range[peaks], reverse=True)
+        
+        # Filter heading sizes based on statistical significance
+        heading_sizes = []
+        for size in potential_heading_sizes:
+            if size > body_text_size + std_size:  # Must be significantly larger than body text
+                heading_sizes.append(size)
+        
+        # Limit to top 6 heading sizes
+        heading_sizes = heading_sizes[:6]
+        
+        # Build heading hierarchy
         heading_styles = {}
         font_hierarchy = {}
-
-        # Map heading levels to font sizes (largest = H1, next = H2, etc.)
-        for i, size in enumerate(heading_sizes[:6]):  # Limit to H1-H6
+        
+        # Map heading levels to font sizes
+        for i, size in enumerate(heading_sizes):
             level = i + 1
             heading_styles[f"h{level}"] = size
             font_hierarchy[size] = level
+            
+            # Calculate confidence score for this heading level
+            size_frequency = size_counter[size] / len(font_sizes)
+            confidence = min(1.0, size_frequency * 10)  # Scale frequency to 0-1 range
+            
+            heading_styles[f"h{level}_confidence"] = confidence
 
-        logger.info(f"📊 Font analysis complete:")
-        logger.info(f"   • Body text style: {body_text_style}")
-        logger.info(f"   • Dominant font size: {dominant_font_size:.1f}pt")
+        # Identify dominant font family
+        dominant_font = max(font_families.items(), key=lambda x: x[1])[0]
+        
+        # Create body text style string
+        body_text_style = f"{dominant_font}, {body_text_size:.1f}pt"
+        if font_weights['bold'] > font_weights['italic']:
+            body_text_style += ", bold"
+        elif font_weights['italic'] > font_weights['bold']:
+            body_text_style += ", italic"
+
+        logger.info(f"📊 Enhanced font analysis complete:")
+        logger.info(f"   • Body text: {body_text_style} (size: {body_text_size:.1f}pt)")
+        logger.info(f"   • Font statistics: mean={mean_size:.1f}, median={median_size:.1f}, std={std_size:.1f}")
         logger.info(f"   • Heading hierarchy: {heading_styles}")
+        logger.info(f"   • Font families: {dict(font_families)}")
 
         return {
             'font_analysis': font_styles,
-            'dominant_font_size': dominant_font_size,
+            'dominant_font_size': body_text_size,
             'heading_font_sizes': set(heading_sizes),
             'font_hierarchy': font_hierarchy,
             'body_text_style': body_text_style,
-            'heading_styles': heading_styles
+            'heading_styles': heading_styles,
+            'font_statistics': {
+                'mean': mean_size,
+                'median': median_size,
+                'std': std_size,
+                'dominant_font': dominant_font
+            }
         }
 
     def _extract_spatial_elements(self, page, page_num, structure_analysis):
@@ -2060,18 +2673,20 @@ class StructuredContentExtractor:
 
     def _classify_content_type_adaptive(self, text, formatting, structure_analysis):
         """
-        Enhanced adaptive content classification with multi-factor analysis.
+        Enhanced adaptive content classification with statistical analysis.
 
-        Addresses detection issues by:
-        1. Analyzing multiple formatting attributes (font, size, style, color)
-        2. Using contextual clues (position, surrounding content)
-        3. Implementing fuzzy matching for font sizes
-        4. Supporting non-standard heading formats
+        Uses multiple factors to classify content:
+        1. Statistical font analysis (size, weight, family)
+        2. Text characteristics (length, patterns)
+        3. Contextual clues (position, surrounding content)
+        4. Confidence scoring for each classification
         """
         import re
+        import numpy as np
 
         # Get document structure information
         font_hierarchy = structure_analysis.get('font_hierarchy', {})
+        font_stats = structure_analysis.get('font_statistics', {})
         dominant_font_size = structure_analysis.get('dominant_font_size', 12.0)
         body_text_style = structure_analysis.get('body_text_style', '')
 
@@ -2095,89 +2710,91 @@ class StructuredContentExtractor:
         if word_count > 20 or text_length > 150:
             return 'paragraph'
 
-        # Check exact font hierarchy match with tolerance
-        for h_font_size, h_level in font_hierarchy.items():
-            if abs(primary_font_size - h_font_size) <= 0.5:  # 0.5pt tolerance
-                logger.debug(f"[Adaptive Classifier] Classified as h{h_level} by font hierarchy match: '{text_clean[:100]}...'. Font: {primary_font_size:.1f} (vs {h_font_size:.1f})")
-                return f'h{h_level}'
-
-        # Multi-factor heading detection
+        # Statistical heading detection
         heading_score = 0.0
         score_details = []
+        confidence = 0.0
 
-        # Font size factor
+        # 1. Font size analysis (40% weight)
         size_ratio = primary_font_size / dominant_font_size if dominant_font_size > 0 else 1.0
-        if size_ratio >= 1.5:
-            heading_score += 0.4; score_details.append(f"SizeRatio>=1.5 ({size_ratio:.2f})")
-        elif size_ratio >= 1.2:
-            heading_score += 0.3; score_details.append(f"SizeRatio>=1.2 ({size_ratio:.2f})")
-        elif size_ratio >= 1.1:
-            heading_score += 0.2; score_details.append(f"SizeRatio>=1.1 ({size_ratio:.2f})")
+        std_dev = font_stats.get('std', 1.0)
+        
+        # Calculate z-score for font size
+        z_score = (primary_font_size - font_stats.get('mean', dominant_font_size)) / std_dev
+        
+        if z_score > 2.0:  # More than 2 standard deviations above mean
+            heading_score += 0.4; score_details.append(f"ZScore>2.0 ({z_score:.2f})")
+        elif z_score > 1.5:
+            heading_score += 0.3; score_details.append(f"ZScore>1.5 ({z_score:.2f})")
+        elif z_score > 1.0:
+            heading_score += 0.2; score_details.append(f"ZScore>1.0 ({z_score:.2f})")
 
-        # Font weight factor
+        # 2. Font weight and style analysis (30% weight)
         if is_bold:
             heading_score += 0.3; score_details.append("Bold")
+        elif is_italic:
+            heading_score += 0.1; score_details.append("ItalicOnly")
 
-        # Font style factor
-        if is_italic and not is_bold:
-            heading_score += 0.1; score_details.append("ItalicOnly") # Italic alone is weaker indicator
-
-        # Font family factor (different from body text)
+        # 3. Font family analysis (10% weight)
         if primary_font and body_text_style:
             if primary_font.lower() not in body_text_style.lower():
-                heading_score += 0.2; score_details.append("DiffFontFamily")
+                heading_score += 0.1; score_details.append("DiffFontFamily")
 
-        # Text length factor (shorter text more likely to be heading)
+        # 4. Text characteristics (20% weight)
+        # Length-based scoring
         if text_length <= 50:
-            heading_score += 0.2; score_details.append(f"Len<=50 ({text_length})")
+            heading_score += 0.1; score_details.append(f"Len<=50 ({text_length})")
         elif text_length <= 100:
-            heading_score += 0.1; score_details.append(f"Len<=100 ({text_length})")
+            heading_score += 0.05; score_details.append(f"Len<=100 ({text_length})")
 
-        # Structural patterns
+        # Pattern-based scoring
         has_patterns = self._has_heading_patterns(text_clean)
         if has_patterns:
-            heading_score += 0.3; score_details.append("HasPatterns")
+            heading_score += 0.1; score_details.append("HasPatterns")
 
-        # Position-based hints (if available)
+        # 5. Position-based analysis
         appears_section_start = self._appears_to_be_section_start(text_clean)
         if appears_section_start:
-            heading_score += 0.2; score_details.append("SectionStart")
+            heading_score += 0.1; score_details.append("SectionStart")
 
-        # Color factor (non-black text might be headings)
-        if font_color != 0:  # Non-black color
-            heading_score += 0.1; score_details.append("NonBlackColor")
+        # Calculate final confidence
+        confidence = min(1.0, heading_score)
 
-        # Determine heading level based on score and size
-        # Increased heading_score threshold from 0.6 to 0.7 for more conservative heading detection,
-        # making it harder for a text block to be classified as a heading based on score.
-        final_classification = 'paragraph'
-        if heading_score >= 0.7:
-            level_reason = ""
-            if size_ratio >= 1.8 or primary_font_size >= dominant_font_size + 6:
-                final_classification = 'h1'; level_reason = "SizeRatio>=1.8 or AbsSize+6"
-            elif size_ratio >= 1.4 or primary_font_size >= dominant_font_size + 4:
-                final_classification = 'h2'; level_reason = "SizeRatio>=1.4 or AbsSize+4"
-            elif size_ratio >= 1.2 or primary_font_size >= dominant_font_size + 2:
-                final_classification = 'h3'; level_reason = "SizeRatio>=1.2 or AbsSize+2"
-            else:
-                final_classification = 'h4'; level_reason = "Default H4 by score"
-            logger.debug(f"[Adaptive Classifier] Classified as {final_classification}: '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). LevelReason: {level_reason}. Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
-            return final_classification
-        # Changed threshold for H4 from 0.4 to 0.5 for more conservative classification
-        elif heading_score >= 0.5: # Minor heading, potentially h4
-            final_classification = 'h4'
-            logger.debug(f"[Adaptive Classifier] Classified as {final_classification} (minor): '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
-            return final_classification
+        # Determine heading level based on font size and hierarchy
+        heading_level = None
+        for h_font_size, h_level in font_hierarchy.items():
+            if abs(primary_font_size - h_font_size) <= 0.5:  # 0.5pt tolerance
+                heading_level = h_level
+                break
 
-        # Check for special content types if not a heading
-        if self._is_list_item_pattern(text_clean):
-            logger.debug(f"[Adaptive Classifier] Classified as list_item: '{text_clean[:100]}...'")
-            return 'list_item'
+        # If no exact match, estimate level based on size ratio
+        if heading_level is None and heading_score >= 0.6:
+            # Estimate level based on how many standard deviations above mean
+            estimated_level = min(6, max(1, int(z_score)))
+            heading_level = estimated_level
 
-        # Default to paragraph, log if it was borderline
-        # Adjusted borderline logging threshold from 0.3 to 0.2 to capture more potential misses if needed in future tuning
-        if heading_score >= 0.2:
-             logger.debug(f"[Adaptive Classifier] Borderline paragraph: '{text_clean[:100]}...'. Score: {heading_score:.2f} (Details: {', '.join(score_details)}). Features: FontSz:{primary_font_size:.1f}, DomSz:{dominant_font_size:.1f}, Bold:{is_bold}, Italic:{is_italic}, WC:{word_count}, Len:{text_length}")
+        # Log classification details
+        if heading_score >= 0.6:
+            logger.debug(
+                f"[Adaptive Classifier] Classified as h{heading_level} "
+                f"(score: {heading_score:.2f}, confidence: {confidence:.2f}): "
+                f"'{text_clean[:100]}...' "
+                f"Details: {', '.join(score_details)}"
+            )
+            return f'h{heading_level}'
+
+        # Check for list items
+        list_patterns = [
+            r'^\s*[•\-\*]\s+',  # Bullet points
+            r'^\s*\d+[\.\)]\s+',  # Numbered lists
+            r'^\s*[a-zA-Z][\.\)]\s+',  # Lettered lists
+        ]
+
+        for pattern in list_patterns:
+            if re.match(pattern, text_clean):
+                return 'list_item'
+
+        # Default to paragraph
         return 'paragraph'
 
     def _detect_bold_from_flags(self, formatting):
@@ -2204,8 +2821,8 @@ class StructuredContentExtractor:
             r'^([A-Z][a-z]+\s){0,6}[A-Z][a-z]+$',
             r'^(Chapter|Section|Part|Appendix)\s+\d+',  # Chapter/Section numbers
             r'^\d+\.\d+',  # Numbered sections like "2.1"
-            r'^[IVX]+\.',  # Roman numerals
-            r'^[A-Z]\.',   # Single letter sections "A."
+            r'^[IVX]+\.\s+[A-Z]',  # Roman numerals
+            r'^[A-Z]\.\s+[A-Z]',  # Single letter sections "A."
         ]
         # Check if the text matches any of the defined heading patterns.
         # These patterns contribute to the heading_score in _classify_content_type_adaptive.
@@ -3831,3 +4448,81 @@ class StructuredContentExtractor:
             logger.warning(f"Error in simple visual detection: {e}")
 
         return visual_areas
+
+    def extract_toc_from_content_two_pass(self, doc, structure_info=None):
+        """
+        Robust two-pass ToC extraction:
+        1. Extract from explicit ToC pages and heading structure.
+        2. Reconcile, deduplicate, and organize hierarchically.
+        Returns a list of dicts: {title, page, level, source}
+        """
+        import re
+        if structure_info is None:
+            structure_info = self.detect_document_structure(doc)
+
+        toc_entries = []
+        toc_page_numbers = structure_info.get('toc_pages', [])
+        heading_hierarchy = structure_info.get('heading_hierarchy', {})
+        section_boundaries = structure_info.get('section_boundaries', [])
+
+        # --- Pass 1: Extract candidates ---
+        # 1A. From explicit ToC pages
+        for page_num in toc_page_numbers:
+            page = doc[page_num]
+            page_text = page.get_text()
+            lines = page_text.split('\n')
+            for line in lines:
+                # Pattern: "Title .......... 5"
+                m = re.match(r'^(.+?)\s*\.{3,}\s*(\d+)$', line.strip())
+                if m:
+                    title = m.group(1).strip()
+                    page_ref = int(m.group(2))
+                    toc_entries.append({
+                        'title': title,
+                        'page': page_ref,
+                        'level': 1,  # Default, will refine in pass 2
+                        'source': 'toc_page'
+                    })
+                # Pattern: "1.1 Section Title   7"
+                m2 = re.match(r'^(\d+(?:\.\d+)*)(?:\s+)(.+?)\s+(\d+)$', line.strip())
+                if m2:
+                    number = m2.group(1)
+                    title = m2.group(2).strip()
+                    page_ref = int(m2.group(3))
+                    level = number.count('.') + 1
+                    toc_entries.append({
+                        'title': f"{number} {title}",
+                        'page': page_ref,
+                        'level': level,
+                        'source': 'toc_page_numbered'
+                    })
+
+        # 1B. From heading structure (section boundaries)
+        for section in section_boundaries:
+            heading = section.get('heading')
+            page = section.get('start_page', None)
+            level = section.get('level', 1)
+            if heading and page is not None:
+                toc_entries.append({
+                    'title': heading,
+                    'page': page + 1,  # Convert to 1-based page
+                    'level': level,
+                    'source': 'heading_structure'
+                })
+
+        # --- Pass 2: Reconcile, deduplicate, organize ---
+        # Deduplicate by (title, page)
+        seen = set()
+        deduped = []
+        for entry in toc_entries:
+            key = (entry['title'].lower().strip(), entry['page'])
+            if key not in seen:
+                seen.add(key)
+                deduped.append(entry)
+
+        # Organize hierarchically (sort by page, then level)
+        deduped.sort(key=lambda x: (x['page'], x['level']))
+
+        # Optionally, build parent-child relationships (not required for flat list)
+        # For now, just output the clean list
+        return deduped
