@@ -114,16 +114,6 @@ Translation Instructions:
 5. Maintain the original tone and formality level
 6. Keep any formatting markers (e.g., **bold**, *italic*) intact
 7. Preserve any internal processing markers (e.g., %%%%ITEM_BREAK%%%%)
-
-PROPER NOUNS AND UNTRANSLATABLE TERMS:
-- Transliterate personal names phonetically into the target language unless a translation is provided in the glossary
-- For example: 'Leah Lakshmi' should be transliterated phonetically
-- Organization names should be transliterated appropriately
-- Do NOT leave proper nouns in English - always provide a target language transliteration
-- If unsure about a name, provide the most phonetically accurate transliteration
-- Pay special attention to names that might be missing their first letter due to parsing errors
-- If you encounter fragments like 'eah akshmi', 'isa ierria', or 'illy's issed', these are likely names with missing first letters
-- Reconstruct these as 'Leah Lakshmi', 'Lisa Sierra', 'Billy's Missed' respectively before transliterating
 """)
         
         # Add the text to be translated
@@ -150,11 +140,8 @@ class EnhancedTranslationService:
                                     prev_context="", next_context="", item_type="text block"):
         """Enhanced translation with better proper noun handling"""
         
-        # Pre-process text to fix common parsing issues
-        processed_text = self._fix_parsing_issues(text)
-        
         # Apply enhanced glossary
-        glossary_applied_text = self.glossary.apply_glossary(processed_text)
+        glossary_applied_text = self.glossary.apply_glossary(text)
         
         # Use enhanced prompt generation
         enhanced_prompt = self.prompt_generator.generate_translation_prompt(
@@ -181,65 +168,8 @@ class EnhancedTranslationService:
             logger.error(f"Enhanced translation failed, using original text: {e}")
             return glossary_applied_text
     
-    def _fix_parsing_issues(self, text):
-        """Fix common parsing issues like missing first letters"""
-        if not text:
-            return text
-        
-        # Common patterns for names with missing first letters
-        # This is a heuristic approach - in practice, you'd want more sophisticated logic
-        
-        # Pattern: "eah akshmi" -> "Leah Lakshmi" (if it looks like a name)
-        words = text.split()
-        fixed_words = []
-        
-        for word in words:
-            # If word looks like it might be missing first letter and is likely a name
-            if (len(word) > 2 and 
-                word[0].islower() and 
-                word[1:].istitle() and
-                self._looks_like_name_fragment(word)):
-                
-                # Try to reconstruct common name patterns
-                fixed_word = self._reconstruct_name(word)
-                fixed_words.append(fixed_word)
-            else:
-                fixed_words.append(word)
-        
-        return ' '.join(fixed_words)
-    
-    def _looks_like_name_fragment(self, word):
-        """Heuristic to determine if a word looks like a name fragment"""
-        # Simple heuristics - could be enhanced with name databases
-        name_indicators = [
-            len(word) >= 3,  # Names are usually at least 3 characters
-            word[1:].istitle(),  # Capitalized after first letter
-            not word.lower() in ['the', 'and', 'or', 'but', 'for', 'with']  # Not common words
-        ]
-        return all(name_indicators)
-    
-    def _reconstruct_name(self, fragment):
-        """Attempt to reconstruct a name from a fragment"""
-        # This is a simplified approach - in practice, you'd use more sophisticated methods
-        
-        # Try to match against known patterns
-        if fragment.lower().startswith('eah'):
-            return 'Leah' + fragment[3:]
-        elif fragment.lower().startswith('isa'):
-            return 'Lisa' + fragment[3:]
-        elif fragment.lower().startswith('illy'):
-            return 'Billy' + fragment[4:]
-        elif fragment.lower().startswith('ierria'):
-            return 'Sierra'  # 'isa ierria' -> 'Lisa Sierra'
-        elif fragment.lower().startswith('issed'):
-            return 'Missed'  # 'illy's issed' -> 'Billy's Missed'
-        
-        # Default: add most likely first letter based on phonetics
-        # This is very basic - a real implementation would use phonetic analysis
-        return fragment.capitalize()  # Just capitalize as fallback
-    
-    # Delegate other methods to base service
     def __getattr__(self, name):
+        """Delegate unknown methods to base service"""
         return getattr(self.base_service, name)
 
 # Create enhanced service instance

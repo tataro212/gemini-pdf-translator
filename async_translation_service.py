@@ -530,7 +530,7 @@ class AsyncTranslationService:
         tasks = []
 
         for i, block in enumerate(content_blocks):
-            # Skip footnotes - they will be handled separately
+            # Skip footnotes entirely - they will be kept in original language
             if isinstance(block, Footnote):
                 continue
 

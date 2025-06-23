@@ -518,14 +518,16 @@ class TranslationService:
 
         for original_block in document.content_blocks:
             if original_block.block_type in {ContentType.HEADING, ContentType.PARAGRAPH,
-                                           ContentType.LIST_ITEM, ContentType.FOOTNOTE,
-                                           ContentType.CAPTION}:
+                                           ContentType.LIST_ITEM, ContentType.CAPTION}:
                 # Use translated version
                 try:
                     all_translated_blocks.append(next(translated_iter))
                 except StopIteration:
                     # Fallback to original if we run out of translated blocks
                     all_translated_blocks.append(original_block)
+            elif original_block.block_type == ContentType.FOOTNOTE:
+                # Keep footnotes in original language
+                all_translated_blocks.append(original_block)
             else:
                 # Keep non-translatable block as-is
                 all_translated_blocks.append(original_block)

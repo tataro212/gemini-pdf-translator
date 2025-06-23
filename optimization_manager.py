@@ -43,9 +43,37 @@ class SmartGroupingProcessor:
         self.settings = config_manager.optimization_settings
         self.max_group_size = self.settings['max_group_size_chars']
         self.max_items_per_group = self.settings['max_items_per_group']
-        # More robust separator that's less likely to be translated
         self.group_separator = "%%%%ITEM_BREAK%%%%"
+        self.special_chars = {
+            'punctuation': r'[.,;:!?()[\]{}""\'\'\-–—]',
+            'math': r'[+\-*/=<>≤≥±∞∑∏∫√]',
+            'special': r'[@#$%^&*_~`|\\]'
+        }
+        self.preserved_chars = {}
         
+    def _preserve_special_chars(self, text: str) -> str:
+        """Preserve special characters by replacing them with unique placeholders"""
+        preserved_text = text
+        self.preserved_chars.clear()
+        
+        # Create unique placeholders for each special character
+        for char_type, pattern in self.special_chars.items():
+            matches = re.finditer(pattern, preserved_text)
+            for i, match in enumerate(matches):
+                char = match.group()
+                placeholder = f"__{char_type}_{i}__"
+                preserved_text = preserved_text.replace(char, placeholder)
+                self.preserved_chars[placeholder] = char
+                
+        return preserved_text
+        
+    def _restore_special_chars(self, text: str) -> str:
+        """Restore special characters from placeholders"""
+        restored_text = text
+        for placeholder, char in self.preserved_chars.items():
+            restored_text = restored_text.replace(placeholder, char)
+        return restored_text
+
     def create_smart_groups(self, content_items):
         """Create intelligent groups from content items"""
         if not self.settings['enable_smart_grouping']:
@@ -158,33 +186,27 @@ class SmartGroupingProcessor:
         return False
 
     def combine_group_for_translation(self, group):
-        """Combine a group of items into a single text for translation with validation and debugging"""
-        combined_texts = []
-
+        """Combine a group of items for translation with special character preservation"""
+        if not group:
+            return ""
+            
+        # Preserve special characters in each item
+        preserved_items = []
         for item in group:
-            text = item.get('text', '').strip()
-            if text:
-                # Apply paragraph placeholder system to preserve paragraph structure
-                prepared_text = prepare_text_for_translation(text)
-                combined_texts.append(prepared_text)
-
+            if isinstance(item, dict) and 'text' in item:
+                preserved_text = self._preserve_special_chars(item['text'])
+                preserved_items.append(preserved_text)
+            else:
+                preserved_items.append(str(item))
+                
         # Combine with separator
-        combined_text = self.group_separator.join(combined_texts)
-
-        # Validate batch size for current model
-        model_name = config_manager.gemini_settings['model_name']
-        if not validate_batch_size_for_model(combined_text, model_name):
-            logger.warning(f"Combined text may be too large for model {model_name}")
-
-        # Log detailed information for debugging
-        logger.debug(f"Combined text for translation:")
-        logger.debug(f"  - Items: {len(group)}")
-        logger.debug(f"  - Characters: {len(combined_text)}")
-        logger.debug(f"  - Estimated tokens: ~{estimate_token_count(combined_text)}")
+        combined_text = self.group_separator.join(preserved_items)
+        
+        logger.debug(f"Combined {len(group)} items for translation")
         logger.debug(f"  - Separator: '{self.group_separator}'")
         logger.debug(f"  - Separator count: {combined_text.count(self.group_separator)}")
         logger.debug(f"  - Preview: {combined_text[:200]}...")
-
+        
         return combined_text
     
     def split_translated_group(self, translated_text, original_group):
@@ -220,9 +242,11 @@ class SmartGroupingProcessor:
         for i, item in enumerate(original_group):
             if i < len(translated_parts):
                 translated_item = item.copy()
-                translated_item['text'] = translated_parts[i].strip()
+                # Restore special characters in the translated text
+                restored_text = self._restore_special_chars(translated_parts[i].strip())
+                translated_item['text'] = restored_text
                 results.append(translated_item)
-                logger.debug(f"Item {i}: '{translated_parts[i][:100]}...'")
+                logger.debug(f"Item {i}: '{restored_text[:100]}...'")
             else:
                 # Fallback: keep original text
                 logger.warning(f"Could not split translated text for item {i}, keeping original")

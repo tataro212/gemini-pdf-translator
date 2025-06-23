@@ -6,6 +6,7 @@ Handles Word document creation and PDF conversion with proper formatting and str
 
 import os
 import logging
+import re
 from docx import Document
 from docx.shared import Pt, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -799,8 +800,9 @@ class WordDocumentGenerator:
             logger.warning(f"Could not add table of contents: {e}")
 
     def _extract_toc_headings(self, structured_content_list):
-        """Extract and organize headings for TOC with accurate page estimation"""
+        """Extract and organize headings for TOC with proper bookmark handling"""
         raw_headings = []
+        seen_headings = set()  # To prevent duplicates
 
         # Enhanced page estimation based on content analysis
         page_estimator = self._create_page_estimator()
@@ -815,17 +817,30 @@ class WordDocumentGenerator:
             if item_type in ['h1', 'h2', 'h3']:
                 text = item.get('text', '').strip()
                 if text:
-                    level = int(item_type[1])  # Extract level from h1, h2, h3
-                    estimated_page = page_estimator.get_current_page()
+                    # Extract TOC bookmark if present
+                    toc_bookmark = None
+                    bookmark_match = re.search(r'_Toc_Bookmark_(\d+)', text)
+                    if bookmark_match:
+                        toc_bookmark = bookmark_match.group(0)
+                        # Remove bookmark from display text but keep it for structure
+                        text = re.sub(r'_Toc_Bookmark_\d+\s*', '', text).strip()
 
-                    raw_headings.append({
-                        'text': text,
-                        'level': level,
-                        'estimated_page': estimated_page,
-                        'original_page': item.get('page_num', estimated_page),
-                        'bbox': item.get('bbox', [0, 0, 0, 0]),  # For proximity analysis
-                        'content_position': page_estimator.get_position_info()
-                    })
+                    # Check for duplicates using cleaned text
+                    clean_text = text.lower()
+                    if clean_text not in seen_headings:
+                        seen_headings.add(clean_text)
+                        level = int(item_type[1])  # Extract level from h1, h2, h3
+                        estimated_page = page_estimator.get_current_page()
+
+                        raw_headings.append({
+                            'text': text,
+                            'level': level,
+                            'estimated_page': estimated_page,
+                            'original_page': item.get('page_num', estimated_page),
+                            'bbox': item.get('bbox', [0, 0, 0, 0]),
+                            'content_position': page_estimator.get_position_info(),
+                            'toc_bookmark': toc_bookmark  # Preserve TOC bookmark
+                        })
 
         # Second pass: merge consecutive headings that appear to be split
         merged_headings = self._merge_split_headings(raw_headings)
@@ -833,14 +848,14 @@ class WordDocumentGenerator:
         # Third pass: clean and format the merged headings with refined page numbers
         final_headings = []
         for heading in merged_headings:
-            clean_text = self._clean_heading_text(heading['text'])
             refined_page = self._refine_page_estimation(heading, merged_headings)
 
             final_headings.append({
-                'text': clean_text,
+                'text': heading['text'],
                 'level': heading['level'],
                 'estimated_page': refined_page,
-                'original_page': heading['original_page']
+                'original_page': heading['original_page'],
+                'toc_bookmark': heading['toc_bookmark']  # Preserve TOC bookmark
             })
 
         return final_headings

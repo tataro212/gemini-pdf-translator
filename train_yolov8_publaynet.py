@@ -9,6 +9,7 @@ import os
 import logging
 import torch
 from pathlib import Path
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -28,14 +29,102 @@ def train_yolov8_on_publaynet():
     # Configuration with GPU memory optimization
     config = {
         'model_size': 'yolov8m.pt',  # Medium model for balance of speed/accuracy
-        'data_config': '../datasets/publaynet_yolo/publaynet.yaml',
-        'epochs': 100,
+        'data_config': '../datasets/publaynet_yolo/data_specialized.yaml',  # Use specialized config
+        'epochs': 200,  # Increased epochs for better accuracy
         'batch_size': 8,  # Reduced for RTX 3050 Laptop GPU
         'image_size': 640,
         'device': 'cuda' if torch.cuda.is_available() else 'cpu',
         'workers': 4,  # Reduced to prevent memory pressure
         'project': 'publaynet_training',
-        'name': f'yolov8_publaynet_finetuned{len([d for d in os.listdir("publaynet_training") if d.startswith("yolov8_publaynet_finetuned")]) + 1 if os.path.exists("publaynet_training") else ""}'
+        'name': f'yolov8_specialized_{int(time.time())}',
+        
+        # Training optimizations
+        'optimizer': 'AdamW',  # Better optimizer
+        'lr0': 0.01,  # Initial learning rate
+        'lrf': 0.001,  # Final learning rate
+        'momentum': 0.937,
+        'weight_decay': 0.0005,
+        'warmup_epochs': 3,
+        'warmup_momentum': 0.8,
+        'warmup_bias_lr': 0.1,
+        'box': 7.5,  # Box loss gain
+        'cls': 0.5,  # Class loss gain
+        'dfl': 1.5,  # DFL loss gain
+        'pose': 12.0,  # Pose loss gain
+        'kobj': 1.0,  # Keypoint obj loss gain
+        'label_smoothing': 0.0,
+        'nbs': 64,  # Nominal batch size
+        'hsv_h': 0.015,  # Image HSV-Hue augmentation
+        'hsv_s': 0.7,  # Image HSV-Saturation augmentation
+        'hsv_v': 0.4,  # Image HSV-Value augmentation
+        'degrees': 0.0,  # Image rotation (+/- deg)
+        'translate': 0.1,  # Image translation (+/- fraction)
+        'scale': 0.5,  # Image scale (+/- gain)
+        'shear': 0.0,  # Image shear (+/- deg)
+        'perspective': 0.0,  # Image perspective (+/- fraction)
+        'flipud': 0.0,  # Image flip up-down (probability)
+        'fliplr': 0.5,  # Image flip left-right (probability)
+        'mosaic': 1.0,  # Image mosaic (probability)
+        'mixup': 0.0,  # Image mixup (probability)
+        'copy_paste': 0.0,  # Segment copy-paste (probability)
+        'auto_augment': 'randaugment',  # Auto augment policy
+        'erasing': 0.4,  # Random erasing (probability)
+        'crop_fraction': 1.0,  # Fraction of image to crop
+        'cache': False,  # Cache images in memory
+        'amp': True,  # Automatic Mixed Precision
+        'rect': False,  # Rectangular training
+        'cos_lr': True,  # Cosine learning rate scheduler
+        'close_mosaic': 10,  # Disable mosaic for last epochs
+        'resume': False,  # Resume training from last checkpoint
+        'patience': 50,  # Early stopping patience
+        'save_period': 5,  # Save checkpoint every N epochs
+        'local_rank': -1,  # Local rank for distributed training
+        'exist_ok': True,  # Overwrite existing experiment
+        'pretrained': True,  # Use pretrained model
+        'optimizer': 'AdamW',  # Optimizer (SGD, Adam, AdamW, etc.)
+        'verbose': True,  # Print verbose output
+        'seed': 0,  # Random seed
+        'deterministic': True,  # Deterministic training
+        'single_cls': False,  # Train as single-class dataset
+        'image_weights': False,  # Use weighted image selection
+        'multi_scale': False,  # Vary img-size +/- 50%
+        'single_cls': False,  # Train as single-class dataset
+        'overlap_mask': True,  # Masks should overlap during training
+        'mask_ratio': 4,  # Mask downsample ratio
+        'dropout': 0.0,  # Use dropout regularization
+        'val': True,  # Validate training results
+        'save_json': False,  # Save a COCO-JSON results file
+        'save_hybrid': False,  # Save hybrid version of labels
+        'conf': None,  # Confidence threshold
+        'iou': 0.7,  # NMS IoU threshold
+        'max_det': 300,  # Maximum detections per image
+        'half': False,  # Use FP16 half-precision inference
+        'dnn': False,  # Use OpenCV DNN for ONNX inference
+        'plots': True,  # Save plots for train/val
+        'source': None,  # Source directory for images
+        'show': False,  # Show results if possible
+        'save_txt': False,  # Save results to *.txt
+        'save_conf': False,  # Save confidences in --save-txt labels
+        'save_crop': False,  # Save cropped prediction boxes
+        'show_labels': True,  # Show labels in plots
+        'show_conf': True,  # Show confidences in plots
+        'show_boxes': True,  # Show boxes in plots
+        'line_width': None,  # Line width of bounding boxes
+        'visualize': False,  # Visualize features
+        'augment': False,  # Apply augmentations to prediction
+        'agnostic_nms': False,  # Class-agnostic NMS
+        'classes': None,  # Filter by class
+        'retina_masks': False,  # Use high-resolution segmentation masks
+        'boxes': True,  # Show boxes in segmentation predictions
+        'format': 'torchscript',  # Export format
+        'keras': False,  # Use Keras
+        'optimize': False,  # TorchScript: optimize for mobile
+        'int8': False,  # CoreML/TF INT8 quantization
+        'dynamic': False,  # ONNX/TF/TensorRT: dynamic axes
+        'simplify': True,  # ONNX: simplify model
+        'opset': None,  # ONNX: opset version
+        'workspace': None,  # TensorRT: workspace size (GB)
+        'nms': False,  # CoreML: add NMS
     }
 
     # GPU memory optimization
@@ -115,32 +204,96 @@ def train_yolov8_on_publaynet():
             patience=50,  # Early stopping patience
             cache=False,  # Disable caching to save memory
             amp=True,  # Automatic Mixed Precision for memory efficiency
-            exist_ok=True  # Allow overwriting existing runs
+            exist_ok=True,  # Allow overwriting existing runs
+            optimizer=config['optimizer'],
+            lr0=config['lr0'],
+            lrf=config['lrf'],
+            momentum=config['momentum'],
+            weight_decay=config['weight_decay'],
+            warmup_epochs=config['warmup_epochs'],
+            warmup_momentum=config['warmup_momentum'],
+            warmup_bias_lr=config['warmup_bias_lr'],
+            box=config['box'],
+            cls=config['cls'],
+            dfl=config['dfl'],
+            pose=config['pose'],
+            kobj=config['kobj'],
+            label_smoothing=config['label_smoothing'],
+            nbs=config['nbs'],
+            hsv_h=config['hsv_h'],
+            hsv_s=config['hsv_s'],
+            hsv_v=config['hsv_v'],
+            degrees=config['degrees'],
+            translate=config['translate'],
+            scale=config['scale'],
+            shear=config['shear'],
+            perspective=config['perspective'],
+            flipud=config['flipud'],
+            fliplr=config['fliplr'],
+            mosaic=config['mosaic'],
+            mixup=config['mixup'],
+            copy_paste=config['copy_paste'],
+            auto_augment=config['auto_augment'],
+            erasing=config['erasing'],
+            crop_fraction=config['crop_fraction'],
+            cache=config['cache'],
+            amp=config['amp'],
+            rect=config['rect'],
+            cos_lr=config['cos_lr'],
+            close_mosaic=config['close_mosaic'],
+            resume=config['resume'],
+            patience=config['patience'],
+            save_period=config['save_period'],
+            local_rank=config['local_rank'],
+            exist_ok=config['exist_ok'],
+            pretrained=config['pretrained'],
+            optimizer=config['optimizer'],
+            verbose=config['verbose'],
+            seed=config['seed'],
+            deterministic=config['deterministic'],
+            single_cls=config['single_cls'],
+            image_weights=config['image_weights'],
+            multi_scale=config['multi_scale'],
+            overlap_mask=config['overlap_mask'],
+            mask_ratio=config['mask_ratio'],
+            dropout=config['dropout'],
+            val=config['val'],
+            save_json=config['save_json'],
+            save_hybrid=config['save_hybrid'],
+            conf=config['conf'],
+            iou=config['iou'],
+            max_det=config['max_det'],
+            half=config['half'],
+            dnn=config['dnn'],
+            plots=config['plots'],
+            source=config['source'],
+            show=config['show'],
+            save_txt=config['save_txt'],
+            save_conf=config['save_conf'],
+            save_crop=config['save_crop'],
+            show_labels=config['show_labels'],
+            show_conf=config['show_conf'],
+            show_boxes=config['show_boxes'],
+            line_width=config['line_width'],
+            visualize=config['visualize'],
+            augment=config['augment'],
+            agnostic_nms=config['agnostic_nms'],
+            classes=config['classes'],
+            retina_masks=config['retina_masks'],
+            boxes=config['boxes'],
+            format=config['format'],
+            keras=config['keras'],
+            optimize=config['optimize'],
+            int8=config['int8'],
+            dynamic=config['dynamic'],
+            simplify=config['simplify'],
+            opset=config['opset'],
+            workspace=config['workspace'],
+            nms=config['nms']
         )
-
-        # Save the final model
-        model_save_path = f"models/yolov8_publaynet_finetuned.pt"
-        os.makedirs("models", exist_ok=True)
-        model.save(model_save_path)
-
+        
         logger.info("✅ Training completed successfully!")
-        logger.info(f"📁 Model saved to: {model_save_path}")
-        logger.info(f"📊 Training results: {config['project']}/{config['name']}")
-
-        # Display training summary
-        logger.info("📈 Training Summary:")
-        logger.info(f"   • Final mAP50: {results.results_dict.get('metrics/mAP50(B)', 'N/A')}")
-        logger.info(f"   • Final mAP50-95: {results.results_dict.get('metrics/mAP50-95(B)', 'N/A')}")
-
-        return model_save_path
-
-    except torch.cuda.OutOfMemoryError as e:
-        logger.error("❌ GPU out of memory! Try reducing batch size or image size")
-        logger.error(f"Current batch size: {config['batch_size']}, try batch_size=2 or 4")
-        return None
-    except KeyboardInterrupt:
-        logger.info("🛑 Training interrupted by user")
-        return None
+        return results
         
     except Exception as e:
         logger.error(f"❌ Training failed: {e}")
@@ -251,17 +404,17 @@ def main():
             return
     
     # Start training
-    model_path = train_yolov8_on_publaynet()
+    results = train_yolov8_on_publaynet()
     
-    if model_path:
+    if results:
         # Validate the trained model
-        validate_trained_model(model_path)
+        validate_trained_model(results.model.model[-1].path)
         
         # Test inference
-        test_model_inference(model_path)
+        test_model_inference(results.model.model[-1].path)
         
         logger.info("🎉 YOLOv8 fine-tuning pipeline completed!")
-        logger.info(f"🎯 Your supreme accuracy model is ready: {model_path}")
+        logger.info(f"🎯 Your supreme accuracy model is ready: {results.model.model[-1].path}")
         logger.info("\nNext steps:")
         logger.info("1. Update yolov8_service.py to use your fine-tuned model")
         logger.info("2. Start the service: python yolov8_service.py")

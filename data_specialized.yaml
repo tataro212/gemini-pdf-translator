@@ -1,7 +1,7 @@
 train: C:/Users/30694/datasets/publaynet_yolo/images/train
 val: C:/Users/30694/datasets/publaynet_yolo/images/val
 
-nc: 10  # number of classes
+nc: 12  # number of classes
 names: [
     'figure',          # diagrams, illustrations, philosophical diagrams
     'table',           # comparison tables, data tables
@@ -12,5 +12,7 @@ names: [
     'footnote',        # footnotes, references
     'equation',        # mathematical equations, logical formulas
     'marginalia',      # margin notes, side comments
-    'bibliography'     # references, citations, works cited
+    'bibliography',    # references, citations, works cited
+    'header',          # page headers, running headers
+    'footer'           # page footers, page numbers
 ] 

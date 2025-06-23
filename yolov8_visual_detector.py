@@ -44,11 +44,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class YOLODetection:
     """Represents a visual element detected by YOLOv8"""
-    label: str  # 'figure', 'table', 'text', 'title', 'list'
+    label: str  # Specialized document element type
     confidence: float
     bounding_box: Tuple[float, float, float, float]  # (x1, y1, x2, y2)
     page_num: int
     detection_id: str
+    content_type: str = "visual"  # visual, text, or mixed
+    parent_id: Optional[str] = None  # For hierarchical relationships
     
     def get_area(self) -> float:
         """Calculate bounding box area"""
@@ -59,6 +61,25 @@ class YOLODetection:
         """Get center point of bounding box"""
         x1, y1, x2, y2 = self.bounding_box
         return ((x1 + x2) / 2, (y1 + y2) / 2)
+    
+    def overlaps_with(self, other: 'YOLODetection', threshold: float = 0.5) -> bool:
+        """Check if this detection overlaps with another"""
+        x1, y1, x2, y2 = self.bounding_box
+        ox1, oy1, ox2, oy2 = other.bounding_box
+        
+        # Calculate intersection area
+        intersect_x1 = max(x1, ox1)
+        intersect_y1 = max(y1, oy1)
+        intersect_x2 = min(x2, ox2)
+        intersect_y2 = min(y2, oy2)
+        
+        if intersect_x2 <= intersect_x1 or intersect_y2 <= intersect_y1:
+            return False
+            
+        intersection_area = (intersect_x2 - intersect_x1) * (intersect_y2 - intersect_y1)
+        min_area = min(self.get_area(), other.get_area())
+        
+        return intersection_area / min_area >= threshold
 
 class YOLOv8VisualDetector:
     """
@@ -78,8 +99,15 @@ class YOLOv8VisualDetector:
             'nms_threshold': 0.4,  # Non-maximum suppression threshold
             'max_detections': 100,  # Maximum detections per page
             'target_dpi': 300,  # DPI for page rendering
-            'supported_classes': ['figure', 'table', 'text', 'title', 'list'],
-            'service_timeout': 30  # Timeout for API calls
+            'supported_classes': [
+                'figure', 'table', 'list', 'title', 'caption', 
+                'quote', 'footnote', 'equation', 'marginalia', 
+                'bibliography', 'header', 'footer'
+            ],
+            'service_timeout': 30,  # Timeout for API calls
+            'min_area': 100,  # Minimum area for valid detections
+            'max_area_ratio': 0.8,  # Maximum area ratio of detection to page
+            'overlap_threshold': 0.5  # Threshold for considering detections as overlapping
         }
         
         # Performance tracking
@@ -87,7 +115,8 @@ class YOLOv8VisualDetector:
             'pages_processed': 0,
             'detections_found': 0,
             'api_calls': 0,
-            'errors': 0
+            'errors': 0,
+            'class_distribution': {cls: 0 for cls in self.config['supported_classes']}
         }
         
         # Check dependencies
@@ -133,21 +162,51 @@ class YOLOv8VisualDetector:
                 # Render page to high-resolution image
                 page_image = self._render_page_to_image(page, self.config['target_dpi'])
                 
+                # Get page dimensions for area validation
+                page_width, page_height = page_image.size
+                page_area = page_width * page_height
+                
                 # Detect visual elements using YOLOv8
                 page_detections = await self._detect_elements_in_page_image(
                     page_image, page_num + 1
                 )
                 
-                # Crop and save detected visual elements
+                # Validate and filter detections
+                valid_detections = []
                 for detection in page_detections:
-                    if detection.label in ['figure', 'table']:  # Only save visual content
+                    # Skip if detection is too large relative to page
+                    if detection.get_area() > page_area * self.config['max_area_ratio']:
+                        continue
+                        
+                    # Skip if detection is too small
+                    if detection.get_area() < self.config['min_area']:
+                        continue
+                    
+                    # Update class distribution statistics
+                    self.stats['class_distribution'][detection.label] += 1
+                    
+                    # Determine content type based on label
+                    if detection.label in ['figure', 'table', 'equation']:
+                        detection.content_type = 'visual'
+                    elif detection.label in ['text', 'title', 'list']:
+                        detection.content_type = 'text'
+                    else:
+                        detection.content_type = 'mixed'
+                    
+                    valid_detections.append(detection)
+                
+                # Handle overlapping detections
+                valid_detections = self._resolve_overlapping_detections(valid_detections)
+                
+                # Crop and save detected visual elements
+                for detection in valid_detections:
+                    if detection.content_type in ['visual', 'mixed']:
                         cropped_image_path = await self._crop_and_save_detection(
                             page_image, detection, images_dir, page_num + 1
                         )
-                        # Update detection with saved image path
                         detection.detection_id = cropped_image_path
                 
-                all_detections.extend(page_detections)
+                all_detections.extend(valid_detections)
                 self.stats['pages_processed'] += 1
             
             doc.close()
@@ -161,6 +220,9 @@ class YOLOv8VisualDetector:
             self.logger.info(f"   📊 Pages processed: {self.stats['pages_processed']}")
             self.logger.info(f"   🎯 Visual elements detected: {len(filtered_detections)}")
             self.logger.info(f"   📈 Average detections per page: {len(filtered_detections) / max(1, self.stats['pages_processed']):.1f}")
+            self.logger.info("   📊 Class distribution:")
+            for cls, count in self.stats['class_distribution'].items():
+                self.logger.info(f"      • {cls}: {count}")
             
             return filtered_detections
             
@@ -169,6 +231,28 @@ class YOLOv8VisualDetector:
             self.stats['errors'] += 1
             # Fallback to heuristic detection
             return await self._fallback_heuristic_detection(pdf_path, output_dir)
+    
+    def _resolve_overlapping_detections(self, detections: List[YOLODetection]) -> List[YOLODetection]:
+        """Resolve overlapping detections by keeping the one with higher confidence"""
+        if not detections:
+            return []
+            
+        # Sort by confidence (highest first)
+        sorted_detections = sorted(detections, key=lambda x: x.confidence, reverse=True)
+        resolved = []
+        
+        for detection in sorted_detections:
+            # Check if this detection overlaps with any already resolved detection
+            overlaps = False
+            for resolved_detection in resolved:
+                if detection.overlaps_with(resolved_detection, self.config['overlap_threshold']):
+                    overlaps = True
+                    break
+            
+            if not overlaps:
+                resolved.append(detection)
+        
+        return resolved
     
     def _render_page_to_image(self, page, dpi: int = 300) -> Image.Image:
         """Render PDF page to high-resolution PIL Image"""
@@ -296,47 +380,7 @@ class YOLOv8VisualDetector:
                 continue
 
             # Filter by minimum area (avoid tiny detections)
-            if detection.get_area() < 100:  # Minimum 100 square pixels
-                continue
-
-            # Filter by confidence
-            if detection.confidence < self.config['confidence_threshold']:
-                continue
-
-            filtered.append(detection)
-
-        # Sort by confidence (highest first)
-        filtered.sort(key=lambda x: x.confidence, reverse=True)
-
-        # Limit maximum detections
-        if len(filtered) > self.config['max_detections']:
-            filtered = filtered[:self.config['max_detections']]
-
-        return filtered
-
-    async def _check_service_availability(self) -> bool:
-        """Check if YOLOv8 service is available"""
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{self.service_url}/health",
-                    timeout=aiohttp.ClientTimeout(total=5)
-                ) as response:
-                    return response.status == 200
-        except:
-            return False
-
-    def _filter_and_validate_detections(self, detections: List[YOLODetection]) -> List[YOLODetection]:
-        """Filter and validate detections for quality and relevance"""
-        filtered = []
-
-        for detection in detections:
-            # Filter by supported classes
-            if detection.label not in self.config['supported_classes']:
-                continue
-
-            # Filter by minimum area (avoid tiny detections)
-            if detection.get_area() < 100:  # Minimum 100 square pixels
+            if detection.get_area() < self.config['min_area']:
                 continue
 
             # Filter by confidence
@@ -392,7 +436,8 @@ class YOLOv8VisualDetector:
                                 confidence=0.8,  # Heuristic confidence
                                 bounding_box=bbox,
                                 page_num=page_num + 1,
-                                detection_id=f"heuristic_page_{page_num + 1}_img_{img_index}"
+                                detection_id=f"heuristic_page_{page_num + 1}_img_{img_index}",
+                                content_type='visual'
                             )
                             detections.append(detection)
                     except:
@@ -413,18 +458,7 @@ class YOLOv8VisualDetector:
             'api_calls_made': self.stats['api_calls'],
             'errors_encountered': self.stats['errors'],
             'average_detections_per_page': self.stats['detections_found'] / max(1, self.stats['pages_processed']),
-            'service_url': self.service_url,
-            'configuration': self.config.copy()
-        }
-
-    def get_detection_statistics(self) -> Dict[str, Any]:
-        """Get detection performance statistics"""
-        return {
-            'pages_processed': self.stats['pages_processed'],
-            'detections_found': self.stats['detections_found'],
-            'api_calls_made': self.stats['api_calls'],
-            'errors_encountered': self.stats['errors'],
-            'average_detections_per_page': self.stats['detections_found'] / max(1, self.stats['pages_processed']),
+            'class_distribution': self.stats['class_distribution'],
             'service_url': self.service_url,
             'configuration': self.config.copy()
         }

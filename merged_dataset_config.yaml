@@ -1,0 +1,83 @@
+# Merged DocLayNet + PubLayNet Dataset Configuration
+# This combines both datasets for comprehensive document layout analysis
+
+# Dataset root directory
+path: C:/Users/30694/datasets
+
+# Train/val/test sets - paths are relative to 'path'
+train: 
+  - doclaynet_yolo/train
+  - publaynet_yolo/images/train
+val: 
+  - doclaynet_yolo/val
+  - publaynet_yolo/images/val
+# test: images/test # path to test images (optional)
+
+# Number of classes (DocLayNet has 8 classes, PubLayNet has 5)
+# We merge similar classes to create a unified 8-class system
+nc: 8
+
+# Class names (merged from both datasets)
+names:
+  0: title          # Document titles, headings
+  1: text           # Body text, paragraphs
+  2: list           # Bullet lists, numbered lists
+  3: table          # Tables, data grids
+  4: figure         # Images, diagrams, charts, graphs
+  5: header         # Page headers, section headers
+  6: footer         # Page footers
+  7: caption        # Figure captions, table captions
+
+# Dataset information
+dataset_name: "Merged DocLayNet + PubLayNet"
+description: "Combined document layout analysis dataset with 8 unified classes"
+source: 
+  - "DocLayNet: https://github.com/DS4SD/DocLayNet"
+  - "PubLayNet: https://github.com/ibm-aur-nlp/PubLayNet"
+
+# Class mapping information
+class_mapping:
+  doclaynet:
+    0: title        # DocLayNet: "Caption" -> title
+    1: text         # DocLayNet: "Footnote" -> text
+    2: list         # DocLayNet: "Formula" -> list (or keep as separate)
+    3: table        # DocLayNet: "List-item" -> list
+    4: figure       # DocLayNet: "Page-footer" -> footer
+    5: header       # DocLayNet: "Page-header" -> header
+    6: footer       # DocLayNet: "Picture" -> figure
+    7: caption      # DocLayNet: "Section-header" -> header
+                     # DocLayNet: "Table" -> table
+                     # DocLayNet: "Text" -> text
+                     # DocLayNet: "Title" -> title
+  
+  publaynet:
+    0: text         # PubLayNet: "Text" -> text
+    1: title        # PubLayNet: "Title" -> title
+    2: list         # PubLayNet: "List" -> list
+    3: table        # PubLayNet: "Table" -> table
+    4: figure       # PubLayNet: "Figure" -> figure
+
+# Training parameters
+training_params:
+  image_size: 640
+  batch_size: 16
+  epochs: 50
+  learning_rate: 0.001
+  patience: 15
+  save_period: 5
+
+# Data augmentation
+augmentation:
+  hsv_h: 0.015      # HSV-Hue augmentation
+  hsv_s: 0.7        # HSV-Saturation augmentation
+  hsv_v: 0.4        # HSV-Value augmentation
+  degrees: 0.0      # Image rotation
+  translate: 0.1    # Image translation
+  scale: 0.5        # Image scaling
+  shear: 0.0        # Image shear
+  perspective: 0.0  # Perspective transform
+  flipud: 0.0       # Vertical flip
+  fliplr: 0.5       # Horizontal flip
+  mosaic: 1.0       # Mosaic augmentation
+  mixup: 0.0        # Mixup augmentation
+  copy_paste: 0.0   # Copy-paste augmentation 

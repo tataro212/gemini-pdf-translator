@@ -69,7 +69,15 @@ class YOLOv8DocumentAnalyzer:
                 1: 'title', 
                 2: 'list',
                 3: 'table',
-                4: 'figure'
+                4: 'figure',
+                5: 'caption',
+                6: 'quote',
+                7: 'footnote',
+                8: 'equation',
+                9: 'marginalia',
+                10: 'bibliography',
+                11: 'header',
+                12: 'footer'
             }
         }
         

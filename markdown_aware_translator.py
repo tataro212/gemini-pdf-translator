@@ -36,6 +36,13 @@ class MarkdownAwareTranslator:
     
     def __init__(self):
         self.md_parser = None
+        self.special_chars = {
+            'punctuation': r'[.,;:!?()[\]{}""\'\'\-–—]',
+            'math': r'[+\-*/=<>≤≥±∞∑∏∫√]',
+            'special': r'[@#$%^&*_~`|\\]'
+        }
+        self.preserved_chars = set()
+        
         if MARKDOWN_IT_AVAILABLE:
             self.md_parser = MarkdownIt("commonmark", {"breaks": True, "html": True})
             logger.info("✅ Markdown-it-py parser initialized")
@@ -66,34 +73,31 @@ class MarkdownAwareTranslator:
                                        translation_func, target_language: str,
                                        context_before: str = "", context_after: str = "") -> str:
         """
-        Translate Markdown content while preserving structure
-
-        Args:
-            markdown_text: The Markdown content to translate
-            translation_func: Async function to translate text
-            target_language: Target language for translation
-            context_before: Context before this content
-            context_after: Context after this content
-
-        Returns:
-            Translated Markdown with preserved structure
+        Translate Markdown content while preserving structure and special characters
         """
         if not self.is_markdown_content(markdown_text):
-            # Not Markdown, translate directly
-            return await translation_func(
-                markdown_text, target_language, "",
+            # Preserve special characters before translation
+            preserved_text = self._preserve_special_chars(markdown_text)
+            translated = await translation_func(
+                preserved_text, target_language, "",
                 context_before, context_after, "text"
             )
+            # Restore special characters after translation
+            return self._restore_special_chars(translated)
 
         logger.info("🔄 Starting structure-preserving Markdown translation")
 
         # Try the most robust method first: Parse-and-Translate (Option A)
         if MARKDOWN_IT_AVAILABLE:
             try:
+                # Preserve special characters in the text
+                preserved_text = self._preserve_special_chars(markdown_text)
                 result = await self._translate_with_parse_and_translate(
-                    markdown_text, translation_func, target_language,
+                    preserved_text, translation_func, target_language,
                     context_before, context_after
                 )
+                # Restore special characters
+                result = self._restore_special_chars(result)
 
                 # Validate structure preservation
                 if self._validate_markdown_structure(markdown_text, result):
@@ -105,10 +109,12 @@ class MarkdownAwareTranslator:
                 logger.warning(f"Parse-and-translate failed: {e}, trying fallback")
 
         # Fallback to enhanced regex method
-        return await self._translate_with_regex(
-            markdown_text, translation_func, target_language,
+        preserved_text = self._preserve_special_chars(markdown_text)
+        result = await self._translate_with_regex(
+            preserved_text, translation_func, target_language,
             context_before, context_after
         )
+        return self._restore_special_chars(result)
 
     async def _translate_with_parse_and_translate(self, markdown_text: str, translation_func,
                                                 target_language: str, context_before: str,
@@ -825,6 +831,29 @@ REMINDER: Return ONLY the translated Markdown with identical structure. Do not a
         cleaned = re.sub(r'(#{1,6}\s+[^\n]+)([^\n])', r'\1\n\n\2', cleaned)
         
         return cleaned
+
+    def _preserve_special_chars(self, text: str) -> str:
+        """Preserve special characters by replacing them with unique placeholders"""
+        preserved_text = text
+        self.preserved_chars.clear()
+        
+        # Create unique placeholders for each special character
+        for char_type, pattern in self.special_chars.items():
+            matches = re.finditer(pattern, preserved_text)
+            for i, match in enumerate(matches):
+                char = match.group()
+                placeholder = f"__{char_type}_{i}__"
+                preserved_text = preserved_text.replace(char, placeholder)
+                self.preserved_chars[placeholder] = char
+                
+        return preserved_text
+        
+    def _restore_special_chars(self, text: str) -> str:
+        """Restore special characters from placeholders"""
+        restored_text = text
+        for placeholder, char in self.preserved_chars.items():
+            restored_text = restored_text.replace(placeholder, char)
+        return restored_text
 
 # Global instance
 markdown_translator = MarkdownAwareTranslator()

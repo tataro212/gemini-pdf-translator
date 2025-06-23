@@ -390,6 +390,15 @@ class DocumentTextRestructurer:
     """
 
     def __init__(self):
+        self.structural_markers = {
+            'sentence_boundary': r'[.!?]',
+            'parenthetical': r'[()\[\]{}]',
+            'punctuation': r'[,;:]',
+            'quote': r'["\']',
+            'special': r'[@#$%^&*_~`|\\]'
+        }
+        self.structure_map = {}
+        
         # Enhanced footnote patterns for better detection
         self.footnote_patterns = [
             r'^\[\d+\]',                 # [1] at start of line
@@ -422,199 +431,110 @@ class DocumentTextRestructurer:
             self.translation_service = None
             self.ai_available = False
 
+    def _preserve_structure(self, text: str) -> str:
+        """Preserve structural markers by replacing them with unique placeholders"""
+        preserved_text = text
+        self.structure_map.clear()
+        
+        # Create unique placeholders for each structural marker
+        for marker_type, pattern in self.structural_markers.items():
+            matches = re.finditer(pattern, preserved_text)
+            for i, match in enumerate(matches):
+                marker = match.group()
+                placeholder = f"__{marker_type}_{i}__"
+                preserved_text = preserved_text.replace(marker, placeholder)
+                self.structure_map[placeholder] = {
+                    'marker': marker,
+                    'type': marker_type,
+                    'position': match.start()
+                }
+                
+        return preserved_text
+        
+    def _restore_structure(self, text: str) -> str:
+        """Restore structural markers from placeholders"""
+        restored_text = text
+        
+        # Sort placeholders by their original position to maintain order
+        sorted_placeholders = sorted(
+            self.structure_map.items(),
+            key=lambda x: x[1]['position']
+        )
+        
+        for placeholder, info in sorted_placeholders:
+            restored_text = restored_text.replace(placeholder, info['marker'])
+            
+        return restored_text
+
     def analyze_and_restructure_text(self, text: str) -> dict:
-        """
-        Analyze text and separate footnotes from main content.
-
-        Args:
-            text: Input text to analyze
-
-        Returns:
-            dict: {
-                'main_content': str,
-                'footnotes': List[str]
-            }
-        """
-        if not text or not text.strip():
+        """Analyze and restructure text while preserving structural markers"""
+        if not text:
             return {'main_content': '', 'footnotes': []}
-
-        # Try AI-powered analysis first if available
-        if self.ai_available:
-            try:
-                return self._ai_text_analysis(text)
-            except Exception as e:
-                logger.error(f"Error in AI text analysis: {e}, falling back to heuristic method")
-
-        # Fallback to heuristic method
-        return self._heuristic_text_analysis(text)
-
-    def _ai_text_analysis(self, text: str) -> dict:
-        """AI-powered text analysis to separate footnotes"""
-        if not self.ai_available:
-            raise Exception("AI analysis not available")
-
-        try:
-            # Enhanced prompt for structured footnote separation
-            analysis_prompt = """You are a document structure analyst. The following text was extracted from a single page of a PDF and may contain a mix of main content, headers, footers, page numbers, and footnotes.
-
-Your task is to intelligently separate these elements.
-
-**INSTRUCTIONS:**
-1. Identify the primary body text of the document.
-2. Identify any text that appears to be a footnote or endnote (often starting with a number or symbol).
-3. Identify any text that is a header, footer, or page number.
-4. Return a JSON object with two keys:
-   - "main_content": A string containing only the main body text, with logical paragraph breaks.
-   - "footnotes": An array of strings, where each string is a distinct footnote you identified.
-
-If no footnotes are found, the "footnotes" array should be empty. Discard all headers, footers, and page numbers.
-
-Here is the page text:
-
-{text}
-
-Respond ONLY with valid JSON in the exact format specified above."""
-
-            # Use the translation service to analyze the text
-            response = self.translation_service.gemini_service.generate_content(
-                analysis_prompt.format(text=text),
-                temperature=0.1
-            )
-
-            if response and hasattr(response, 'text'):
-                import json
-                try:
-                    # Parse the JSON response
-                    result = json.loads(response.text.strip())
-
-                    # Validate the response structure
-                    if isinstance(result, dict) and 'main_content' in result and 'footnotes' in result:
-                        if isinstance(result['footnotes'], list):
-                            logger.info(f"🤖 AI restructuring: {len(result['footnotes'])} footnotes separated")
-                            return result
-                        else:
-                            logger.warning("AI response footnotes not a list, falling back to heuristic")
-                    else:
-                        logger.warning("AI response missing required keys, falling back to heuristic")
-
-                except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse AI response as JSON: {e}, falling back to heuristic")
-
-            else:
-                logger.warning("No valid AI response received, falling back to heuristic")
-
-        except Exception as e:
-            logger.error(f"Error in AI text analysis: {e}, falling back to heuristic")
-
-        # Fallback to heuristic method
-        return self._heuristic_text_analysis(text)
+            
+        # Preserve structural markers before analysis
+        preserved_text = self._preserve_structure(text)
+        
+        # Perform text analysis
+        analysis = self._heuristic_text_analysis(preserved_text)
+        
+        # Restore structural markers in the results
+        if analysis['main_content']:
+            analysis['main_content'] = self._restore_structure(analysis['main_content'])
+        if analysis['footnotes']:
+            analysis['footnotes'] = [self._restore_structure(fn) for fn in analysis['footnotes']]
+            
+        return analysis
 
     def _heuristic_text_analysis(self, text: str) -> dict:
-        """Enhanced heuristic-based text analysis to separate footnotes"""
-        import re
-
+        """Enhanced heuristic text analysis with structure preservation"""
         lines = text.split('\n')
         main_lines = []
         footnote_lines = []
-
-        in_footnote_section = False
-        footnote_section_start_idx = None
-
-        # First pass: identify footnote section boundaries
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-            if not line_stripped:
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
                 continue
-
-            # Check for footnote section indicators
-            for pattern in self.footnote_section_indicators:
-                if re.match(pattern, line_stripped, re.IGNORECASE):
-                    in_footnote_section = True
-                    footnote_section_start_idx = i
-                    break
-
-        # Second pass: classify lines
-        in_footnote_section = False
-        consecutive_footnotes = 0
-
-        for i, line in enumerate(lines):
-            line_stripped = line.strip()
-
-            # Empty lines
-            if not line_stripped:
-                if not in_footnote_section:
-                    main_lines.append('')
-                continue
-
-            # Check if we've hit a footnote section indicator
-            if footnote_section_start_idx and i >= footnote_section_start_idx:
-                in_footnote_section = True
-
-            # Check if line looks like a footnote
-            is_footnote = False
-            for pattern in self.footnote_patterns:
-                if re.match(pattern, line_stripped, re.IGNORECASE):
-                    is_footnote = True
-                    consecutive_footnotes += 1
-                    break
-
-            # If we found multiple consecutive footnotes, we're likely in footnote section
-            if consecutive_footnotes >= 2:
-                in_footnote_section = True
-
-            # Additional heuristics for footnote detection
-            if not is_footnote and not in_footnote_section:
-                # Check if line is very short and at end of text (likely page number)
-                if len(line_stripped) <= 3 and i > len(lines) * 0.8:
-                    is_footnote = True
-                # Check if line contains typical footnote content
-                elif any(indicator in line_stripped.lower() for indicator in
-                        ['ibid', 'op. cit', 'loc. cit', 'et al', 'pp.', 'vol.']):
-                    is_footnote = True
-                    in_footnote_section = True
-
-            if is_footnote or in_footnote_section:
-                footnote_lines.append(line_stripped)
-                if not is_footnote:
-                    consecutive_footnotes = 0  # Reset if not a numbered footnote
+                
+            # Check for footnote patterns
+            is_footnote = any(re.match(pattern, line, re.IGNORECASE)
+                            for pattern in self.footnote_patterns)
+                            
+            if is_footnote:
+                footnote_lines.append(line)
             else:
                 main_lines.append(line)
-                consecutive_footnotes = 0  # Reset counter
-
-        # Clean up main content - remove trailing empty lines
+                
+        # Clean up main content
         while main_lines and not main_lines[-1].strip():
             main_lines.pop()
-
+            
         main_content = '\n'.join(main_lines).strip()
-
-        # Process footnotes - group related lines
+        
+        # Process footnotes with structure preservation
         processed_footnotes = []
         if footnote_lines:
             current_footnote = ""
             for line in footnote_lines:
-                # Check if this starts a new footnote
                 is_new_footnote = any(re.match(pattern, line, re.IGNORECASE)
                                     for pattern in self.footnote_patterns)
-
+                                    
                 if is_new_footnote and current_footnote:
-                    # Save previous footnote
                     processed_footnotes.append(current_footnote.strip())
                     current_footnote = line
                 elif is_new_footnote:
                     current_footnote = line
                 else:
-                    # Continue current footnote
                     if current_footnote:
                         current_footnote += " " + line
                     else:
                         current_footnote = line
-
-            # Don't forget the last footnote
+                        
             if current_footnote:
                 processed_footnotes.append(current_footnote.strip())
-
+                
         logger.info(f"📝 Enhanced heuristic restructuring: {len(processed_footnotes)} footnotes separated")
-
+        
         return {
             'main_content': main_content,
             'footnotes': processed_footnotes

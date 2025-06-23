@@ -1859,10 +1859,12 @@ class PDFParser:
         return layout_info
         
     def _analyze_heading_hierarchy(self, doc, structure_info):
-        """Analyze and establish heading hierarchy"""
+        """Analyze and establish heading hierarchy with improved context awareness"""
         heading_styles = defaultdict(list)
+        font_families = defaultdict(int)
         
-        for page_num in range(len(doc)):  # Changed to analyze all pages
+        # First pass: collect all potential headings and font statistics
+        for page_num in range(len(doc)):
             page = doc[page_num]
             blocks = page.get_text("dict")["blocks"]
             
@@ -1872,14 +1874,20 @@ class PDFParser:
                         for span in line["spans"]:
                             text = span.get("text", "").strip()
                             if self._is_heading_candidate(text, span):
+                                font = span.get("font", "")
+                                font_families[font] += 1
                                 heading_styles[span.get("size", 0)].append({
                                     'text': text,
-                                    'font': span.get("font", ""),
+                                    'font': font,
                                     'flags': span.get("flags", 0),
-                                    'page': page_num
+                                    'page': page_num,
+                                    'bbox': span.get("bbox", (0, 0, 0, 0))
                                 })
                                 
-        # Establish heading levels based on font size and style
+        # Determine dominant font family for headings
+        dominant_font = max(font_families.items(), key=lambda x: x[1])[0] if font_families else None
+        
+        # Establish heading levels based on font size, style, and context
         heading_hierarchy = {}
         sorted_sizes = sorted(heading_styles.keys(), reverse=True)
         
@@ -1889,10 +1897,35 @@ class PDFParser:
             base_size = max(sorted_sizes) if sorted_sizes else 16
             sorted_sizes = [base_size, base_size * 0.8, base_size * 0.6]
         
+        # Analyze heading patterns for each size
         for i, size in enumerate(sorted_sizes):
+            examples = heading_styles.get(size, [])
+            patterns = defaultdict(int)
+            
+            # Analyze patterns in examples
+            for example in examples:
+                text = example['text']
+                # Count different heading patterns
+                if re.match(r'^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$', text):
+                    patterns['title_case'] += 1
+                elif re.match(r'^\d+\.', text):
+                    patterns['numbered'] += 1
+                elif re.match(r'^[IVX]+\.', text):
+                    patterns['roman'] += 1
+                elif re.match(r'^[A-Z]\.', text):
+                    patterns['lettered'] += 1
+                elif re.match(r'^Chapter\s+\d+', text):
+                    patterns['chapter'] += 1
+            
+            # Determine most common pattern
+            dominant_pattern = max(patterns.items(), key=lambda x: x[1])[0] if patterns else None
+            
             heading_hierarchy[f'h{i+1}'] = {
                 'font_size': size,
-                'examples': heading_styles.get(size, [])[:3]  # Keep first 3 examples
+                'font_family': dominant_font,
+                'pattern': dominant_pattern,
+                'examples': examples[:3],  # Keep first 3 examples
+                'confidence': min(1.0, len(examples) / 5)  # Confidence based on number of examples
             }
             
         return heading_hierarchy
@@ -4526,3 +4559,52 @@ class StructuredContentExtractor:
         # Optionally, build parent-child relationships (not required for flat list)
         # For now, just output the clean list
         return deduped
+
+    def _clean_text_content(self, text: str) -> str:
+        """
+        Clean text content by removing footnotes and properly handling TOC bookmarks.
+        """
+        # Remove footnotes (assuming they are numbered and at the end of lines)
+        text = re.sub(r'\s*\d+\s*$', '', text, flags=re.MULTILINE)
+        
+        # Remove footnote references in text (e.g., [1], [2], etc.)
+        text = re.sub(r'\[\d+\]', '', text)
+        
+        # Handle TOC bookmarks - ensure there's a space between bookmark and text
+        # First, handle bookmarks at the start of text
+        text = re.sub(r'^(_Toc_Bookmark_\d+)([^\s])', r'\1 \2', text)
+        # Then handle bookmarks in the middle of text
+        text = re.sub(r'([^\s])(_Toc_Bookmark_\d+)([^\s])', r'\1 \2 \3', text)
+        # Finally handle bookmarks at the end of text
+        text = re.sub(r'([^\s])(_Toc_Bookmark_\d+)$', r'\1 \2', text)
+        
+        return text.strip()
+
+    def _extract_page_content(self, page, page_num, structure_analysis):
+        """Extract content from a page with enhanced cleaning"""
+        try:
+            # Get text blocks
+            blocks = page.get_text("dict")["blocks"]
+            content_blocks = []
+            
+            for block in blocks:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text = span["text"].strip()
+                            if text:
+                                # Clean the text content
+                                text = self._clean_text_content(text)
+                                if text:  # Only add if there's content after cleaning
+                                    content_blocks.append({
+                                        'text': text,
+                                        'bbox': span["bbox"],
+                                        'font': span["font"],
+                                        'size': span["size"],
+                                        'flags': span["flags"]
+                                    })
+        
+            return content_blocks
+        except Exception as e:
+            logger.error(f"Error extracting content from page {page_num}: {e}")
+            return []

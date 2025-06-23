@@ -49,9 +49,11 @@ def sanitize_for_xml(text: str) -> str:
     """
     if not isinstance(text, str):
         return text
-    # This regex removes control characters from \x00 to \x1F, but keeps
-    # tab (\x09), newline (\x0A), and carriage return (\x0D).
-    return re.sub(r'[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F\\x7F]', '', text)
+        
+    # Only remove actual XML control characters (0x00-0x1F except tab, newline, carriage return)
+    # and the DEL character (0x7F)
+    # This preserves all other characters including Unicode
+    return re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
 
 def sanitize_filepath(filepath: str) -> str:
     """
